@@ -1,0 +1,16 @@
+# Archivos de Python generados
+__pycache__/
+*.pyc
+
+# Archivos de datos (Resultados)
+*.xlsx
+*.csv
+
+# Archivos de sistema y logs
+.DS_Store
+*.log
+
+# Carpetas de entornos (por si creas una a futuro)
+.venv/
+venv/
+env/
