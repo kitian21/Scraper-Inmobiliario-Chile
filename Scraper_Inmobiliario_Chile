@@ -5,16 +5,19 @@ import time
 import urllib3
 import re
 import sys
+import os
+from datetime import datetime
+from tqdm import tqdm # Barra de progreso
+
+# --- SELENIUM ---
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# --- CONFIGURACIÓN GENERAL ---
+# --- CONFIGURACIÓN ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
 
 # ==============================================================================
 # 🛠️ FUNCIONES DE APOYO (INTELIGENCIA)
@@ -37,7 +40,6 @@ def deducir_region(texto_full):
     elif "coyhaique" in t or "aysén" in t: return "Aysén"
     elif "punta arenas" in t or "magallanes" in t: return "Magallanes"
     
-    # Fallbacks específicos
     if "viii región" in t: return "Biobío"
     if "rm" in t: return "Metropolitana"
     if "iii región" in t: return "Atacama"
@@ -75,8 +77,7 @@ def iniciar_selenium():
 # ==============================================================================
 # 1. CONSTRUCTORA EBCO S.A.
 # ==============================================================================
-def modulo_ebco():
-    print(f"   🔨 [1/10] Procesando EBCO...")
+def modulo_ebco(driver=None): # driver opcional para compatibilidad
     links_totales = []
     pagina = 1
     while pagina <= 8:
@@ -116,14 +117,12 @@ def modulo_ebco():
             if m_sup: data["Superficie"] = m_sup.group(1).strip()
             todos.append(data)
         except: pass
-    print(f"      -> {len(todos)} proyectos encontrados.")
     return todos
 
 # ==============================================================================
 # 2. INMOBILIARIA Y CONSTRUCTORA INGEVEC S.A
 # ==============================================================================
-def modulo_ingevec():
-    print(f"   🔨 [2/10] Procesando INGEVEC...")
+def modulo_ingevec(driver=None):
     try:
         res = requests.get("https://ingevecinmobiliaria.cl/proyectos-en-venta", headers=HEADERS, verify=False, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -151,24 +150,24 @@ def modulo_ingevec():
                 
                 if d["Ubicación"] == "N/A":
                     for a in s.find_all('a', href=True):
-                        if "maps" in a['href']: 
+                        if "maps" in a['href'] or "waze" in a['href']:
                             tx = a.get_text(strip=True)
-                            if len(tx)>5 and any(c.isdigit() for c in tx): d["Ubicación"] = tx; break
+                            if len(tx)>5 and any(c.isdigit() for c in tx) and "mapa" not in tx.lower():
+                                d["Ubicación"] = tx; break
                 
                 if d["Obra"] != "N/A": d["Obra"] = separar_palabras_pegadas(d["Obra"])
-                if d["Obra"] == "N/A" or "conectividad" in d["Obra"].lower(): d["Obra"] = limpiar_nombre_url(url)
+                if d["Obra"] == "N/A" or any(m in d["Obra"].lower() for m in ["conectividad", "entrega", "ganadora"]):
+                    d["Obra"] = limpiar_nombre_url(url)
                 if not d["Región"]: d["Región"] = deducir_region(d["Ubicación"] + " " + d["Obra"])
                 todos.append(d)
             except: pass
-        print(f"      -> {len(todos)} proyectos encontrados.")
         return todos
     except: return []
 
 # ==============================================================================
 # 3. SOCOVESA INMOBILIARIA Y CONSTRUCCIONES
 # ==============================================================================
-def modulo_socovesa():
-    print(f"   🔨 [3/10] Procesando SOCOVESA...")
+def modulo_socovesa(driver=None):
     links_totales = []
     pagina = 1
     while pagina <= 10:
@@ -212,14 +211,12 @@ def modulo_socovesa():
             if not data["Región"]: data["Región"] = deducir_region(data["Ubicación"] + " " + txt)
             todos.append(data)
         except: pass
-    print(f"      -> {len(todos)} proyectos encontrados.")
     return todos
 
 # ==============================================================================
 # 4. CONSTRUCTORA POCURO SPA
 # ==============================================================================
 def modulo_pocuro(driver):
-    print(f"   🔨 [4/10] Procesando POCURO (Selenium)...")
     todos = []
     try:
         driver.get("https://www.pocuro.cl/proyectos")
@@ -258,15 +255,13 @@ def modulo_pocuro(driver):
                 d["Región"] = deducir_region(d["Ubicación"] + " " + t)
                 todos.append(d)
             except: continue
-        print(f"      -> {len(todos)} proyectos encontrados.")
         return todos
     except: return []
 
 # ==============================================================================
 # 5. CONSTRUCTORA OVAL
 # ==============================================================================
-def modulo_oval():
-    print(f"   🔨 [5/10] Procesando OVAL...")
+def modulo_oval(driver=None):
     try:
         res = requests.get("https://www.constructoraoval.cl/proyectos/", headers=HEADERS, verify=False, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -294,22 +289,19 @@ def modulo_oval():
                 
                 todos.append(d)
             except: pass
-        print(f"      -> {len(todos)} proyectos encontrados.")
         return todos
     except: return []
 
 # ==============================================================================
 # 6. CONSTRUCTORA PACAL S.A
 # ==============================================================================
-def modulo_pacal():
-    print(f"   🔨 [6/10] Procesando PACAL...")
+def modulo_pacal(driver=None):
     try:
         res = requests.get("https://pacal.cl/proyectos-pacal/", headers=HEADERS, verify=False, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
         todos_datos = []
         parrafos = soup.find_all('p')
         for p in parrafos:
-            # Fix V26: usar espacio
             txt = p.get_text(" ", strip=True)
             if "Dirección" in txt and "Ciudad" in txt:
                 try:
@@ -330,14 +322,12 @@ def modulo_pacal():
                             data["Obra"] = t_lnk.replace("Condominio", "").replace("Edificio", "").strip()
                             data["Link"] = prev_a['href']
                             break
-                        prev_a = prev_a.find_previous('a', href=True)
-                        i+=1
+                        prev_a = prev_a.find_previous('a', href=True); i+=1
                     todos_datos.append(data)
                 except: continue
         seen = set(); uniq = []
         for d in todos_datos:
             if d['Obra'] not in seen and d['Obra']!="N/A": uniq.append(d); seen.add(d['Obra'])
-        print(f"      -> {len(uniq)} proyectos encontrados.")
         return uniq
     except: return []
 
@@ -345,7 +335,6 @@ def modulo_pacal():
 # 7. CONSTRUCTORA SANTOLAYA
 # ==============================================================================
 def modulo_santolaya(driver):
-    print(f"   🔨 [7/10] Procesando SANTOLAYA (Selenium)...")
     url = "https://santolaya.cl/proyectos-venta"
     todos = []
     try:
@@ -376,15 +365,13 @@ def modulo_santolaya(driver):
         seen = set(); uniq = []
         for d in todos:
             if d['Obra'] not in seen: uniq.append(d); seen.add(d['Obra'])
-        print(f"      -> {len(uniq)} proyectos encontrados.")
         return uniq
     except: return []
 
 # ==============================================================================
-# 8. CONSTRUCTORA GUZMAN Y LARRAÍN LTDA.
+# 8. CONSTRUCTORA GUZMAN Y LARRAI­N LTDA.
 # ==============================================================================
 def modulo_guzman(driver):
-    print(f"   🔨 [8/10] Procesando GUZMÁN Y LARRAÍN (Selenium)...")
     url = "https://www.guzmanylarrain.com/proyectos/venta"
     proyectos = []
     try:
@@ -414,7 +401,6 @@ def modulo_guzman(driver):
     except: return []
 
     finales = []
-    print(f"      ... Validando direcciones ({len(proyectos)})...")
     for p in proyectos:
         try:
             driver.get(p['Link']); time.sleep(1.5)
@@ -429,21 +415,17 @@ def modulo_guzman(driver):
                     if len(txt)>5 and any(c.isdigit() for c in txt): 
                         p["Ubicación"] = txt; found = True; break
             if not found:
-                # Text fallback
                 txt_det = s.get_text(" ", strip=True)
                 m = re.search(r"Direcci[oó]n\s*[:\.]?\s*(.*?)(?=Horario|Teléfono|$)", txt_det, re.IGNORECASE)
                 if m: p["Ubicación"] = m.group(1).strip()
             finales.append(p)
         except: finales.append(p)
-    
-    print(f"      -> {len(finales)} proyectos encontrados.")
     return finales
 
 # ==============================================================================
 # 9. CONSTRUCTORA PAZ SPA
 # ==============================================================================
 def modulo_paz(driver):
-    print(f"   🔨 [9/10] Procesando PAZ (Selenium)...")
     url = "https://www.paz.cl/resultado-busqueda"
     base = []
     try:
@@ -471,7 +453,6 @@ def modulo_paz(driver):
     except: return []
 
     finales = []
-    print(f"      ... Validando direcciones ({len(base)})...")
     for p in base:
         if p["Ubicación"] != "N/A": finales.append(p); continue
         try:
@@ -497,15 +478,12 @@ def modulo_paz(driver):
             if "_backup" in p: del p["_backup"]
             finales.append(p)
         except: finales.append(p)
-    
-    print(f"      -> {len(finales)} proyectos encontrados.")
     return finales
 
 # ==============================================================================
 # 10. CONSTRUCTORA CARRAN S.A
 # ==============================================================================
 def modulo_carran(driver):
-    print(f"   🔨 [10/10] Procesando CARRAN (Selenium)...")
     try:
         driver.get("https://www.constructoracarran.cl/")
         time.sleep(4)
@@ -530,82 +508,164 @@ def modulo_carran(driver):
                     if v_m2: data["Superficie"] = v_m2.get_text(strip=True) + " m²"
                 if data["Obra"] != "N/A": todos.append(data)
             except: continue
-        
         seen = set(); uniq = []
         for d in todos:
             if d['Obra'] not in seen: uniq.append(d); seen.add(d['Obra'])
-        print(f"      -> {len(uniq)} proyectos encontrados.")
         return uniq
     except: return []
 
 # ==============================================================================
-# 🚀 ORQUESTADOR SECUENCIAL
+# 🎯 MENÚ DE USUARIO Y EJECUCIÓN
 # ==============================================================================
-def main():
-    print("--- 🤖 INICIANDO SCRAPER DE 10 CONSTRUCTORAS (V46) ---")
-    todos_los_datos = []
+def imprimir_menu():
+    print("\n" + "="*50)
+    print("   🏙️  SCRAPER INMOBILIARIO CHILE - PANEL DE CONTROL")
+    print("="*50)
+    print("1. Escanear TODO (Las 10 Inmobiliarias)")
+    print("2. Solo Rápidas (Requests: Oval, Ebco, Ingevec, Socovesa, Pacal)")
+    print("3. Solo Lentas (Selenium: Pocuro, Santolaya, Guzman, Paz, Carran)")
+    print("4. Seleccionar una inmobiliaria específica...")
+    print("0. Salir")
+    print("-" * 50)
 
-    # Abrimos navegador una vez para todos
-    print("\n   🌐 Iniciando Navegador Maestro (Se mantendrá abierto)...")
-    driver = iniciar_selenium()
-    
+def menu_especifico():
+    print("\n--- SELECCIONA UNA INMOBILIARIA ---")
+    print("1. EBCO")
+    print("2. INGEVEC")
+    print("3. SOCOVESA")
+    print("4. POCURO")
+    print("5. OVAL")
+    print("6. PACAL")
+    print("7. SANTOLAYA")
+    print("8. GUZMÁN Y LARRAÍN")
+    print("9. PAZ")
+    print("10. CARRÁN")
     try:
-        # SECUENCIA EXACTA PEDIDA
-        
-        # 1. EBCO (Requests)
-        todos_los_datos.extend(modulo_ebco())
-        
-        # 2. INGEVEC (Requests)
-        todos_los_datos.extend(modulo_ingevec())
-        
-        # 3. SOCOVESA (Requests)
-        todos_los_datos.extend(modulo_socovesa())
-        
-        # 4. POCURO (Selenium)
-        todos_los_datos.extend(modulo_pocuro(driver))
-        
-        # 5. OVAL (Requests)
-        todos_los_datos.extend(modulo_oval())
-        
-        # 6. PACAL (Requests)
-        todos_los_datos.extend(modulo_pacal())
-        
-        # 7. SANTOLAYA (Selenium)
-        todos_los_datos.extend(modulo_santolaya(driver))
-        
-        # 8. GUZMAN (Selenium)
-        todos_los_datos.extend(modulo_guzman(driver))
-        
-        # 9. PAZ (Selenium)
-        todos_los_datos.extend(modulo_paz(driver))
-        
-        # 10. CARRAN (Selenium)
-        todos_los_datos.extend(modulo_carran(driver))
+        return int(input(">> Elige número: "))
+    except: return 0
 
-    except Exception as e:
-        print(f"❌ Error crítico en orquestador: {e}")
-    finally:
-        driver.quit()
-        print("\n   🌐 Navegador cerrado.")
+def ejecutar_modulo(driver, num):
+    if num == 1: return modulo_ebco(driver)
+    elif num == 2: return modulo_ingevec(driver)
+    elif num == 3: return modulo_socovesa(driver)
+    elif num == 4: return modulo_pocuro(driver)
+    elif num == 5: return modulo_oval(driver)
+    elif num == 6: return modulo_pacal(driver)
+    elif num == 7: return modulo_santolaya(driver)
+    elif num == 8: return modulo_guzman(driver)
+    elif num == 9: return modulo_paz(driver)
+    elif num == 10: return modulo_carran(driver)
+    return []
 
-    # GUARDAR
-    if todos_los_datos:
-        print("\n💾 Guardando Excel Maestro...")
-        df = pd.DataFrame(todos_los_datos)
-        
-        # Limpieza duplicados
+def guardar_datos(datos, modo_archivo):
+    if not datos:
+        print("❌ No hay datos para guardar.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    if modo_archivo == 1:
+        # CONSOLIDADO
+        df = pd.DataFrame(datos)
         df = df.drop_duplicates(subset=['Obra', 'Inmobiliaria'])
+        nombre = f"Consolidado_Chile_{timestamp}.xlsx"
+        df.to_excel(nombre, index=False)
+        print(f"\n💾 Archivo guardado: {nombre}")
         
-        cols = ["Inmobiliaria", "Obra", "Mandante", "Ubicación", "Región", "Superficie", "Link"]
-        final_cols = [c for c in cols if c in df.columns]
-        df = df[final_cols]
+    elif modo_archivo == 2:
+        # SEPARADO
+        carpeta = f"Resultados_{timestamp}"
+        os.makedirs(carpeta, exist_ok=True)
+        print(f"\n📂 Creando carpeta: {carpeta}")
         
-        archivo = "Consolidado_10_Constructoras.xlsx"
-        df.to_excel(archivo, index=False)
-        print(f"🎉 ¡ÉXITO! Archivo guardado como: {archivo}")
-        print("Total proyectos:", len(df))
-    else:
-        print("❌ No data.")
+        df = pd.DataFrame(datos)
+        grupos = df.groupby('Inmobiliaria')
+        
+        for nombre_inmo, grupo in grupos:
+            # Limpiamos nombre para archivo
+            safe_name = re.sub(r'[^a-zA-Z0-9]', '_', str(nombre_inmo))
+            archivo = f"{carpeta}/{safe_name}.xlsx"
+            grupo.to_excel(archivo, index=False)
+            print(f"   -> Guardado: {archivo} ({len(grupo)} items)")
+
+def main():
+    while True:
+        imprimir_menu()
+        try:
+            opcion = int(input(">> Ingresa tu opción: "))
+        except:
+            print("❌ Opción inválida."); continue
+
+        if opcion == 0: break
+
+        # Preguntar formato de archivo
+        print("\n--- FORMATO DE SALIDA ---")
+        print("1. Un solo Excel consolidado")
+        print("2. Multiples archivos (uno por inmobiliaria)")
+        try:
+            modo_archivo = int(input(">> Elige (1 o 2): "))
+        except: modo_archivo = 1
+
+        todos_los_datos = []
+        driver = None
+        
+        # Siempre iniciamos driver para simplificar la lógica del bucle
+        print("   🌐 Abriendo navegador (un momento)...")
+        driver = iniciar_selenium()
+        
+        try:
+            if opcion == 1: # TODAS
+                print("\n🚀 Iniciando escaneo completo...")
+                # Lista de tareas EN EL ORDEN PEDIDO
+                tareas = [
+                    ("EBCO", modulo_ebco),
+                    ("INGEVEC", modulo_ingevec),
+                    ("SOCOVESA", modulo_socovesa),
+                    ("POCURO", modulo_pocuro),
+                    ("OVAL", modulo_oval),
+                    ("PACAL", modulo_pacal),
+                    ("SANTOLAYA", modulo_santolaya),
+                    ("GUZMAN", modulo_guzman),
+                    ("PAZ", modulo_paz),
+                    ("CARRAN", modulo_carran)
+                ]
+                
+                pbar = tqdm(tareas, desc="Progreso General", unit="empresa")
+                
+                for nombre, func in pbar:
+                    pbar.set_description(f"Procesando {nombre}")
+                    # Pasamos el driver a todas, las que no lo usan lo ignoran
+                    res = func(driver)
+                    todos_los_datos.extend(res)
+                    time.sleep(1)
+
+            elif opcion == 2: # RÁPIDAS
+                modulos = [modulo_ebco, modulo_ingevec, modulo_socovesa, modulo_oval, modulo_pacal]
+                for m in tqdm(modulos, desc="Rápidas"):
+                    todos_los_datos.extend(m(driver))
+
+            elif opcion == 3: # LENTAS
+                modulos = [modulo_pocuro, modulo_santolaya, modulo_guzman, modulo_paz, modulo_carran]
+                for m in tqdm(modulos, desc="Lentas"):
+                    todos_los_datos.extend(m(driver))
+
+            elif opcion == 4: # ESPECÍFICA
+                sel = menu_especifico()
+                if sel > 0:
+                    todos_los_datos.extend(ejecutar_modulo(driver, sel))
+
+            # Guardar
+            guardar_datos(todos_los_datos, modo_archivo)
+            
+            if opcion != 4: 
+                input("\n✅ Proceso terminado. Presiona Enter para volver al menú...")
+
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+        finally:
+            if driver: 
+                driver.quit()
+                print("   👋 Navegador cerrado.")
 
 if __name__ == "__main__":
     main()
