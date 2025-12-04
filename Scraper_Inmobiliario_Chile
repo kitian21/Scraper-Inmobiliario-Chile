@@ -7,7 +7,7 @@ import re
 import sys
 import os
 from datetime import datetime
-from tqdm import tqdm # Barra de progreso visual
+from tqdm import tqdm
 
 # --- SELENIUM ---
 from selenium import webdriver
@@ -15,16 +15,47 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# --- CONFIGURACIÓN GLOBAL ---
+# --- CONFIGURACIÓN ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
 
 # ==============================================================================
-# 🛠️ FUNCIONES DE APOYO (GLOBALES)
+# 🛠️ FUNCIONES DE INTELIGENCIA (V51 - FECHAS HISTÓRICAS)
 # ==============================================================================
 
+def extraer_fecha_entrega(texto):
+    """
+    Busca patrones de entrega, años pasados/futuros o estado del proyecto.
+    """
+    t = str(texto).lower()
+    
+    # 1. Estados Clave (Tienen prioridad)
+    if "inmediata" in t: return "Entrega Inmediata"
+    if "en verde" in t: return "En Verde"
+    if "en blanco" in t: return "En Blanco"
+    if "pronta entrega" in t: return "Pronta Entrega"
+    if "vendido" in t or "agotado" in t: return "Agotado/Vendido"
+    if "futuro" in t or "lanzamiento" in t: return "Lanzamiento"
+    
+    # 2. Rangos de Años (Ej: "2018-2020", "2023 - 2025")
+    match_rango = re.search(r"(20\d{2})\s*-\s*(20\d{2})", t)
+    if match_rango:
+        return f"{match_rango.group(1)}-{match_rango.group(2)}"
+
+    # 3. Semestres/Trimestres (Cualquier año 20xx)
+    match_semestre = re.search(r"(1er|2do|primer|segundo|tercer|cuarto)\s*(sem|semestre|trimestre)?\s*(de)?\s*(20\d{2})", t)
+    if match_semestre:
+        return match_semestre.group(0).title()
+        
+    # 4. Año Suelto (Ej: "Año 2018", "Entrega 2020")
+    # Busca 20xx precedido por palabras clave o espacios
+    match_anio = re.search(r"(entrega|año|desde|periodo|construcción)\s*(20\d{2})", t)
+    if match_anio:
+        return "Año " + match_anio.group(2)
+
+    return "Consultar"
+
 def deducir_region(texto_full):
-    """Asigna la región basada en la ciudad o comuna encontrada en el texto."""
     t = str(texto_full).lower()
     if any(x in t for x in ["metropolitana", "santiago", "lampa", "padre hurtado", "buin", "huechuraba", "san bernardo", "maipú", "florida", "ñuñoa", "cisterna", "central", "independencia", "cerrillos", "macul", "san miguel", "providencia", "las condes", "vitacura", "lo barnechea", "puente alto", "san joaquín", "recoleta", "quilicura", "conchalí", "la reina", "peñalolén"]): return "Metropolitana"
     elif any(x in t for x in ["arica"]): return "Arica y Parinacota"
@@ -41,8 +72,6 @@ def deducir_region(texto_full):
     elif any(x in t for x in ["iquique", "hospicio"]): return "Tarapacá"
     elif "coyhaique" in t or "aysén" in t: return "Aysén"
     elif "punta arenas" in t or "magallanes" in t: return "Magallanes"
-    
-    # Fallbacks específicos
     if "viii región" in t: return "Biobío"
     if "rm" in t: return "Metropolitana"
     if "iii región" in t: return "Atacama"
@@ -50,7 +79,6 @@ def deducir_region(texto_full):
     return ""
 
 def limpiar_nombre_url(url):
-    """Recupera el nombre desde la URL si el HTML falla."""
     try:
         slug = url.split("/")[-1].split("?")[0]
         if not slug: slug = url.split("/")[-2].split("?")[0]
@@ -61,12 +89,10 @@ def limpiar_nombre_url(url):
     except: return "N/A"
 
 def separar_palabras_pegadas(texto):
-    """Corrige 'SantiagoCentro' a 'Santiago Centro'."""
     if not texto: return ""
     return re.sub(r'([a-z])([A-Z])', r'\1 \2', texto)
 
 def es_direccion_invalida(texto):
-    """Filtra direcciones de oficinas centrales."""
     t = str(texto).lower()
     if "apoquindo" in t and "4501" in t: return True
     if "ventas" in t or "horario" in t or "fono" in t: return True
@@ -74,30 +100,21 @@ def es_direccion_invalida(texto):
     return False
 
 def iniciar_selenium(): 
-    """Inicia navegador invisible."""
     opts = Options()
     opts.add_argument("--headless")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--log-level=3")
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
-# ==============================================================================
-# 🛠️ FUNCIONES DE LIMPIEZA ESPECÍFICAS
-# ==============================================================================
-
 def limpiar_basura_legal_oval(texto):
-    """
-    USO EXCLUSIVO: CONSTRUCTORA OVAL.
-    Elimina disclaimers legales pegados a la región.
-    """
     if not texto: return "N/A"
-    texto = texto.split('*')[0] # Cortar en asterisco
+    texto = texto.split('*')[0]
     texto = texto.split('Los bocetos')[0]
     texto = texto.split('Las imágenes')[0]
     return texto.strip()
 
 # ==============================================================================
-# MÓDULOS DE EXTRACCIÓN (Requests - Rápidos)
+# MÓDULOS DE EXTRACCIÓN (Requests)
 # ==============================================================================
 
 # 1. EBCO
@@ -137,6 +154,11 @@ def modulo_ebco(driver=None):
                 data["Región"] = deducir_region(data["Ubicación"])
             m_sup = re.search(r"Superficie[:\s]+(.*?)(?=Imágenes|Ubicaci|Mandante|$)", txt, re.IGNORECASE)
             if m_sup: data["Superficie"] = m_sup.group(1).strip()
+            
+            # FECHA
+            data["Estado/Entrega"] = extraer_fecha_entrega(txt)
+            if "ejecución" in txt.lower(): data["Estado/Entrega"] = "En Ejecución"
+            
             todos.append(data)
         except: pass
     return todos
@@ -175,6 +197,10 @@ def modulo_ingevec(driver=None):
                 if d["Obra"] == "N/A" or any(m in d["Obra"].lower() for m in ["conectividad", "entrega", "ganadora"]):
                     d["Obra"] = limpiar_nombre_url(url)
                 if not d["Región"]: d["Región"] = deducir_region(d["Ubicación"] + " " + d["Obra"])
+                
+                # FECHA
+                d["Estado/Entrega"] = extraer_fecha_entrega(t)
+                
                 todos.append(d)
             except: pass
         return todos
@@ -217,11 +243,15 @@ def modulo_socovesa(driver=None):
             match_sup = re.search(r"Superficie[:\s]+(\d+[\.,]?\d*\s*m2?)", txt, re.IGNORECASE)
             if match_sup: data["Superficie"] = match_sup.group(1)
             if not data["Región"]: data["Región"] = deducir_region(data["Ubicación"] + " " + txt)
+            
+            # FECHA
+            data["Estado/Entrega"] = extraer_fecha_entrega(txt)
+            
             todos.append(data)
         except: pass
     return todos
 
-# 4. POCURO (Selenium)
+# 4. POCURO
 def modulo_pocuro(driver):
     todos = []
     try:
@@ -230,7 +260,6 @@ def modulo_pocuro(driver):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
         tarjetas = soup.find_all('a', class_="card-proyecto")
         if not tarjetas: tarjetas = soup.find_all('a', href=True)
         links = []
@@ -238,7 +267,6 @@ def modulo_pocuro(driver):
             href = card.get('href')
             if href and "/proyecto/" in href:
                 links.append("https://www.pocuro.cl" + href if href.startswith("/") else href)
-        
         for link in list(set(links)):
             try:
                 driver.get(link); time.sleep(1)
@@ -252,12 +280,16 @@ def modulo_pocuro(driver):
                 m_sup = re.search(r"(\d+[\.,]?\d*\s*m²?)", t, re.IGNORECASE)
                 if m_sup and float(m_sup.group(1).lower().replace("m²","").replace("m2","").replace(",",".")) > 20: d["Superficie"] = m_sup.group(1)
                 d["Región"] = deducir_region(d["Ubicación"] + " " + t)
+                
+                # FECHA
+                d["Estado/Entrega"] = extraer_fecha_entrega(t)
+                
                 todos.append(d)
             except: continue
         return todos
     except: return []
 
-# 5. OVAL (Requests)
+# 5. OVAL
 def modulo_oval(driver=None):
     try:
         res = requests.get("https://www.constructoraoval.cl/proyectos/", headers=HEADERS, verify=False, timeout=15)
@@ -273,22 +305,25 @@ def modulo_oval(driver=None):
                 m_o = re.search(r"Obra[:\s]+(.*?)(?=Unidades|Destino|$)", t, re.IGNORECASE); 
                 if m_o: d["Obra"] = m_o.group(1).strip()
                 elif s.find('h1'): d["Obra"] = s.find('h1').get_text(strip=True)
-                
                 m_u = re.search(r"Ubicaci[oó]n[:\s]+(.*?)(?=Regi|Mandante|$)", t, re.IGNORECASE); 
                 if m_u: d["Ubicación"] = m_u.group(1).strip()
                 
-                # ---> USO EXCLUSIVO DE LIMPIEZA LEGAL PARA OVAL <---
+                # FIX OVAL EXCLUSIVO
                 m_r = re.search(r"Regi[oó]n[:\s]+(.*?)(?=Previous|Next|$)", t, re.IGNORECASE); 
                 if m_r: d["Región"] = limpiar_basura_legal_oval(m_r.group(1))
                 
                 m_s = re.search(r"Superficie edificada[:\s]+(.*?)(?=Mandante|Destino|$)", t, re.IGNORECASE); 
                 if m_s: d["Superficie"] = m_s.group(1).strip()
+                
+                # FECHA
+                d["Estado/Entrega"] = extraer_fecha_entrega(t)
+                
                 todos.append(d)
             except: pass
         return todos
     except: return []
 
-# 6. PACAL (Requests Directo)
+# 6. PACAL
 def modulo_pacal(driver=None):
     try:
         res = requests.get("https://pacal.cl/proyectos-pacal/", headers=HEADERS, verify=False, timeout=15)
@@ -316,6 +351,10 @@ def modulo_pacal(driver=None):
                             data["Link"] = prev_a['href']
                             break
                         prev_a = prev_a.find_previous('a', href=True); i+=1
+                    
+                    # FECHA (Pacal la suele poner en otro <p> cercano, pero usaremos el radar)
+                    data["Estado/Entrega"] = extraer_fecha_entrega(txt)
+                    
                     todos_datos.append(data)
                 except: continue
         seen = set(); uniq = []
@@ -324,7 +363,7 @@ def modulo_pacal(driver=None):
         return uniq
     except: return []
 
-# 7. SANTOLAYA (Selenium)
+# 7. SANTOLAYA
 def modulo_santolaya(driver):
     url = "https://santolaya.cl/proyectos-venta"
     todos = []
@@ -351,6 +390,12 @@ def modulo_santolaya(driver):
                 if sup: 
                     m = re.search(r"(\d+.*?[mM]2)", sup)
                     if m: data["Superficie"] = m.group(1)
+                
+                # FECHA
+                banner = btn.find_previous(string=re.compile("Entrega|Nuevo", re.IGNORECASE))
+                if banner: data["Estado/Entrega"] = banner.strip()
+                else: data["Estado/Entrega"] = "Consultar"
+
                 todos.append(data)
             except: continue
         seen = set(); uniq = []
@@ -359,7 +404,7 @@ def modulo_santolaya(driver):
         return uniq
     except: return []
 
-# 8. GUZMÁN Y LARRAÍN (Selenium)
+# 8. GUZMAN Y LARRAIN
 def modulo_guzman(driver):
     url = "https://www.guzmanylarrain.com/proyectos/venta"
     proyectos = []
@@ -382,6 +427,10 @@ def modulo_guzman(driver):
                 txt_card = tarjeta.get_text(" ", strip=True)
                 m = re.search(r"(\d+[\.,]?\d*)\s*m²", txt_card)
                 if m: data["Superficie"] = f"{m.group(0)}"
+                
+                # FECHA
+                data["Estado/Entrega"] = extraer_fecha_entrega(txt_card)
+                
                 proyectos.append(data)
             except: continue
     except: return []
@@ -406,7 +455,7 @@ def modulo_guzman(driver):
         except: finales.append(p)
     return finales
 
-# 9. PAZ (Selenium)
+# 9. PAZ
 def modulo_paz(driver):
     url = "https://www.paz.cl/resultado-busqueda"
     base = []
@@ -427,6 +476,11 @@ def modulo_paz(driver):
                     tc = co.get_text(strip=True); d["Región"] = deducir_region(tc); d["_backup"] = tc
                     if not d["Región"]: d["Región"] = tc
                 if d["Obra"]!="N/A" and any(x.isdigit() for x in d["Obra"]) and "etapa" not in d["Obra"].lower(): d["Ubicación"] = d["Obra"].title()
+                
+                # FECHA
+                txt_card = c.get_text(" ", strip=True)
+                d["Estado/Entrega"] = extraer_fecha_entrega(txt_card)
+                
                 base.append(d)
             except: continue
     except: return []
@@ -448,16 +502,14 @@ def modulo_paz(driver):
                 m = re.search(r"(Av\.|Avenida|Calle|Pasaje)\s+[A-ZÁÉÍÓÚÑa-z\s\.]+\d+", s.get_text(" ", strip=True))
                 if m: cand = m.group(0)
             
-            # Anti-Oficina Check
             if es_direccion_invalida(cand): cand = "N/A"
-            
             p["Ubicación"] = cand if cand != "N/A" else p.get("_backup", "N/A")
             if "_backup" in p: del p["_backup"]
             finales.append(p)
         except: finales.append(p)
     return finales
 
-# 10. CARRAN (Selenium)
+# 10. CARRAN
 def modulo_carran(driver):
     try:
         driver.get("https://www.constructoracarran.cl/")
@@ -477,6 +529,15 @@ def modulo_carran(driver):
                 if l_m2:
                     v_m2 = l_m2.find_previous_sibling('span', class_="project-card__stat-value")
                     if v_m2: data["Superficie"] = v_m2.get_text(strip=True) + " m²"
+                
+                # FECHA (Periodo)
+                l_per = card.find('span', class_="project-card__stat-label", string=re.compile("Periodo", re.IGNORECASE))
+                if l_per:
+                    v_per = l_per.find_previous_sibling('span', class_="project-card__stat-value")
+                    if v_per: data["Estado/Entrega"] = v_per.get_text(strip=True)
+                else:
+                    data["Estado/Entrega"] = "Consultar"
+
                 if data["Obra"] != "N/A": todos.append(data)
             except: continue
         seen = set(); uniq = []
@@ -486,33 +547,22 @@ def modulo_carran(driver):
     except: return []
 
 # ==============================================================================
-# 🎯 MENÚ Y EJECUCIÓN
+# 🎯 EJECUCIÓN
 # ==============================================================================
 def imprimir_menu():
     print("\n" + "="*50)
-    print("   🏙️  SCRAPER INMOBILIARIO CHILE - PANEL V49")
+    print("   🏙️  SCRAPER INMOBILIARIO CHILE - PANEL V51")
     print("="*50)
     print("1. Escanear TODO (Las 10 Inmobiliarias)")
-    print("2. Solo Rápidas (Requests: Oval, Ebco, Ingevec, Socovesa, Pacal)")
-    print("3. Solo Lentas (Selenium: Pocuro, Santolaya, Guzman, Paz, Carran)")
+    print("2. Solo Rápidas (Requests)")
+    print("3. Solo Lentas (Selenium)")
     print("4. Seleccionar una inmobiliaria específica...")
     print("0. Salir")
     print("-" * 50)
 
 def menu_especifico():
-    print("\n--- SELECCIONA UNA INMOBILIARIA ---")
-    print("1. EBCO")
-    print("2. INGEVEC")
-    print("3. SOCOVESA")
-    print("4. POCURO")
-    print("5. OVAL")
-    print("6. PACAL")
-    print("7. SANTOLAYA")
-    print("8. GUZMÁN Y LARRAÍN")
-    print("9. PAZ")
-    print("10. CARRÁN")
-    try:
-        return int(input(">> Elige número: "))
+    print("\n1. EBCO\n2. INGEVEC\n3. SOCOVESA\n4. POCURO\n5. OVAL\n6. PACAL\n7. SANTOLAYA\n8. GUZMÁN\n9. PAZ\n10. CARRÁN")
+    try: return int(input(">> Elige número: "))
     except: return 0
 
 def ejecutar_modulo(driver, num):
@@ -529,100 +579,74 @@ def ejecutar_modulo(driver, num):
     return []
 
 def guardar_datos(datos, modo_archivo):
-    if not datos:
-        print("❌ No hay datos para guardar.")
-        return
-
+    if not datos: print("❌ No hay datos."); return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    fecha_hoy = datetime.now().strftime("%d/%m/%Y")
     
+    # Agregar fecha a todos los registros
+    for d in datos: d["Fecha Scrapeo"] = fecha_hoy
+
     if modo_archivo == 1:
         df = pd.DataFrame(datos)
         df = df.drop_duplicates(subset=['Obra', 'Inmobiliaria'])
+        # Reordenar columnas para que se vea bien
+        cols = ["Fecha Scrapeo", "Inmobiliaria", "Obra", "Estado/Entrega", "Ubicación", "Región", "Superficie", "Link", "Mandante"]
+        exist_cols = [c for c in cols if c in df.columns]
+        df = df[exist_cols]
         nombre = f"Consolidado_Chile_{timestamp}.xlsx"
         df.to_excel(nombre, index=False)
         print(f"\n💾 Archivo guardado: {nombre}")
-        
     elif modo_archivo == 2:
         carpeta = f"Resultados_{timestamp}"
         os.makedirs(carpeta, exist_ok=True)
-        print(f"\n📂 Creando carpeta: {carpeta}")
         df = pd.DataFrame(datos)
         grupos = df.groupby('Inmobiliaria')
         for nombre_inmo, grupo in grupos:
             safe_name = re.sub(r'[^a-zA-Z0-9]', '_', str(nombre_inmo))
-            archivo = f"{carpeta}/{safe_name}.xlsx"
-            grupo.to_excel(archivo, index=False)
-            print(f"   -> Guardado: {archivo}")
+            grupo.to_excel(f"{carpeta}/{safe_name}.xlsx", index=False)
+            print(f"   -> {safe_name}.xlsx")
 
 def main():
     while True:
         imprimir_menu()
-        try:
-            opcion = int(input(">> Ingresa tu opción: "))
-        except:
-            print("❌ Opción inválida."); continue
-
+        try: opcion = int(input(">> Opción: "))
+        except: continue
         if opcion == 0: break
 
-        print("\n--- FORMATO DE SALIDA ---")
-        print("1. Un solo Excel consolidado")
-        print("2. Multiples archivos (uno por inmobiliaria)")
-        try:
-            modo_archivo = int(input(">> Elige (1 o 2): "))
-        except: modo_archivo = 1
+        print("\n--- SALIDA ---")
+        print("1. Un solo Excel\n2. Multiples archivos")
+        try: modo = int(input(">> Elige: "))
+        except: modo = 1
 
-        todos_los_datos = []
+        todos = []
         driver = None
-        print("   🌐 Abriendo navegador (un momento)...")
+        print("   🌐 Iniciando motor...")
         driver = iniciar_selenium()
         
         try:
             if opcion == 1: # TODAS
-                print("\n🚀 Iniciando escaneo completo...")
-                tareas = [
-                    ("EBCO", modulo_ebco, False),
-                    ("INGEVEC", modulo_ingevec, False),
-                    ("SOCOVESA", modulo_socovesa, False),
-                    ("POCURO", modulo_pocuro, True),
-                    ("OVAL", modulo_oval, False),
-                    ("PACAL", modulo_pacal, False),
-                    ("SANTOLAYA", modulo_santolaya, True),
-                    ("GUZMAN", modulo_guzman, True),
-                    ("PAZ", modulo_paz, True),
-                    ("CARRAN", modulo_carran, True)
-                ]
-                pbar = tqdm(tareas, desc="Progreso General", unit="empresa")
-                for nombre, func, usa_driver in pbar:
-                    pbar.set_description(f"Procesando {nombre}")
-                    res = func(driver)
-                    todos_los_datos.extend(res)
+                tareas = [("EBCO", modulo_ebco, False), ("INGEVEC", modulo_ingevec, False), ("SOCOVESA", modulo_socovesa, False), ("POCURO", modulo_pocuro, True), ("OVAL", modulo_oval, False), ("PACAL", modulo_pacal, False), ("SANTOLAYA", modulo_santolaya, True), ("GUZMAN", modulo_guzman, True), ("PAZ", modulo_paz, True), ("CARRAN", modulo_carran, True)]
+                pbar = tqdm(tareas, desc="Progreso", unit="empresa")
+                for nom, func, _ in pbar:
+                    pbar.set_description(f"Procesando {nom}")
+                    todos.extend(func(driver))
                     time.sleep(1)
-
-            elif opcion == 2: 
+            elif opcion == 2:
                 modulos = [modulo_ebco, modulo_ingevec, modulo_socovesa, modulo_oval, modulo_pacal]
-                for m in tqdm(modulos, desc="Rápidas"):
-                    todos_los_datos.extend(m())
-
+                for m in tqdm(modulos, desc="Rápidas"): todos.extend(m(driver))
             elif opcion == 3:
                 modulos = [modulo_pocuro, modulo_santolaya, modulo_guzman, modulo_paz, modulo_carran]
-                for m in tqdm(modulos, desc="Lentas"):
-                    todos_los_datos.extend(m(driver))
-
+                for m in tqdm(modulos, desc="Lentas"): todos.extend(m(driver))
             elif opcion == 4:
                 sel = menu_especifico()
-                if sel > 0:
-                    todos_los_datos.extend(ejecutar_modulo(driver, sel))
+                if sel > 0: todos.extend(ejecutar_modulo(driver, sel))
 
-            guardar_datos(todos_los_datos, modo_archivo)
-            if opcion != 4: 
-                input("\n✅ Proceso terminado. Presiona Enter para volver al menú...")
+            guardar_datos(todos, modo)
+            if opcion != 4: input("\n✅ Listo. Enter para volver...")
 
-        except Exception as e:
-            print(f"\n❌ Error: {e}")
+        except Exception as e: print(f"\n❌ Error: {e}")
         finally:
-            if driver: 
-                driver.quit()
-                print("   👋 Navegador cerrado.")
+            if driver: driver.quit()
 
 if __name__ == "__main__":
     main()
