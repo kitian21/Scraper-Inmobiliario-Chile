@@ -8,6 +8,7 @@ import sys
 import os
 from datetime import datetime
 from tqdm import tqdm
+from urllib.parse import unquote  # para decodificar URLs con %2C, etc. [web:74]
 
 # --- SELENIUM ---
 from selenium import webdriver
@@ -17,55 +18,133 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # --- CONFIGURACIÓN ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/91.0.4472.124 Safari/537.36"
+    )
+}
 
 # ==============================================================================
-# 🛠️ FUNCIONES DE INTELIGENCIA (V51 - FECHAS HISTÓRICAS)
+# 🛠️ FUNCIONES DE INTELIGENCIA (V51 - FECHAS HISTÓRICAS + COORDENADAS)
 # ==============================================================================
+
+def _coords_desde_url_maps(url: str):
+    """
+    Intenta extraer coordenadas de URLs de Google Maps / Waze:
+    - https://www.google.com/maps/@LAT,LON,zoom...
+    - ...!3dLAT!4dLON...
+    - ...?ll=LAT,LON...
+    Devuelve (lat, lon) o (None, None). [web:58][web:80]
+    """
+    # @LAT,LON,zoom
+    m = re.search(r"@(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", url)
+    if m:
+        return m.group(1), m.group(2)
+
+    # !3dLAT!4dLON
+    m = re.search(r"!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)", url)
+    if m:
+        return m.group(1), m.group(2)
+
+    # ?ll=LAT,LON
+    m = re.search(r"[?&]ll=(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", url)
+    if m:
+        return m.group(1), m.group(2)
+
+    # Fallback genérico lat,lon en la URL
+    m = re.search(r"(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", url)
+    if m:
+        return m.group(1), m.group(2)
+
+    return None, None
+
+def extraer_coordenadas_desde_mapas(soup: BeautifulSoup):
+    """
+    Radar genérico de coordenadas en una ficha:
+    0) data-lat / data-lng (Leaflet, como en Socovesa)
+    1) iframes de Google Maps
+    2) enlaces a Google Maps / Waze
+    3) lat,lon en texto plano [web:79][web:82]
+    """
+    # 0) data-lat / data-lng
+    cont_map = soup.find(attrs={"data-lat": True, "data-lng": True})
+    if cont_map:
+        lat = cont_map.get("data-lat")
+        lng = cont_map.get("data-lng")
+        if lat and lng:
+            return lat, lng
+
+    # 1) iframes de mapas
+    for iframe in soup.find_all('iframe', src=True):
+        src = iframe['src']
+        lat, lon = _coords_desde_url_maps(src)
+        if lat and lon:
+            return lat, lon
+
+    # 2) enlaces a Google Maps / Waze
+    for a in soup.find_all('a', href=True):
+        h_dec = unquote(a['href'])
+        if "google.com/maps" in h_dec or "waze.com" in h_dec:
+            lat, lon = _coords_desde_url_maps(h_dec)
+            if lat and lon:
+                return lat, lon
+
+    # 3) fallback: lat,lon en texto plano
+    txt = soup.get_text(" ", strip=True)
+    m = re.search(r"(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", txt)
+    if m:
+        return m.group(1), m.group(2)
+
+    return None, None
 
 def extraer_fecha_entrega(texto):
-    """
-    Busca patrones de entrega, años pasados/futuros o estado del proyecto.
-    """
     t = str(texto).lower()
-    
-    # 1. Estados Clave (Tienen prioridad)
     if "inmediata" in t: return "Entrega Inmediata"
     if "en verde" in t: return "En Verde"
     if "en blanco" in t: return "En Blanco"
     if "pronta entrega" in t: return "Pronta Entrega"
     if "vendido" in t or "agotado" in t: return "Agotado/Vendido"
     if "futuro" in t or "lanzamiento" in t: return "Lanzamiento"
-    
-    # 2. Rangos de Años (Ej: "2018-2020", "2023 - 2025")
     match_rango = re.search(r"(20\d{2})\s*-\s*(20\d{2})", t)
     if match_rango:
         return f"{match_rango.group(1)}-{match_rango.group(2)}"
-
-    # 3. Semestres/Trimestres (Cualquier año 20xx)
-    match_semestre = re.search(r"(1er|2do|primer|segundo|tercer|cuarto)\s*(sem|semestre|trimestre)?\s*(de)?\s*(20\d{2})", t)
+    match_semestre = re.search(
+        r"(1er|2do|primer|segundo|tercer|cuarto)\s*"
+        r"(sem|semestre|trimestre)?\s*(de)?\s*(20\d{2})",
+        t
+    )
     if match_semestre:
         return match_semestre.group(0).title()
-        
-    # 4. Año Suelto (Ej: "Año 2018", "Entrega 2020")
-    # Busca 20xx precedido por palabras clave o espacios
     match_anio = re.search(r"(entrega|año|desde|periodo|construcción)\s*(20\d{2})", t)
     if match_anio:
         return "Año " + match_anio.group(2)
-
     return "Consultar"
 
 def deducir_region(texto_full):
     t = str(texto_full).lower()
-    if any(x in t for x in ["metropolitana", "santiago", "lampa", "padre hurtado", "buin", "huechuraba", "san bernardo", "maipú", "florida", "ñuñoa", "cisterna", "central", "independencia", "cerrillos", "macul", "san miguel", "providencia", "las condes", "vitacura", "lo barnechea", "puente alto", "san joaquín", "recoleta", "quilicura", "conchalí", "la reina", "peñalolén"]): return "Metropolitana"
+    if any(x in t for x in [
+        "metropolitana", "santiago", "lampa", "padre hurtado", "buin", "huechuraba",
+        "san bernardo", "maipú", "florida", "ñuñoa", "cisterna", "central",
+        "independencia", "cerrillos", "macul", "san miguel", "providencia",
+        "las condes", "vitacura", "lo barnechea", "puente alto", "san joaquín",
+        "recoleta", "quilicura", "conchalí", "la reina", "peñalolén"
+    ]): return "Metropolitana"
     elif any(x in t for x in ["arica"]): return "Arica y Parinacota"
     elif any(x in t for x in ["antofagasta", "calama"]): return "Antofagasta"
     elif any(x in t for x in ["coquimbo", "ovalle", "serena", "vicuña"]): return "Coquimbo"
-    elif any(x in t for x in ["valparaíso", "viña", "concon", "concón", "quilpué", "villa alemana", "limache", "quillota", "marga marga", "papudo"]): return "Valparaíso"
+    elif any(x in t for x in [
+        "valparaíso", "viña", "concon", "concón", "quilpué", "villa alemana",
+        "limache", "quillota", "marga marga", "papudo"
+    ]): return "Valparaíso"
     elif any(x in t for x in ["rancagua", "machalí", "rengo", "san fernando"]): return "O'Higgins"
     elif any(x in t for x in ["talca", "curicó", "linares", "maule"]): return "Maule"
     elif any(x in t for x in ["chillán", "ñuble", "san carlos"]): return "Ñuble"
-    elif any(x in t for x in ["concepción", "coronel", "biobío", "san pedro", "hualpén", "hualpen", "talcahuano", "los ángeles", "chiguayante"]): return "Biobío"
+    elif any(x in t for x in [
+        "concepción", "coronel", "biobío", "san pedro", "hualpén", "hualpen",
+        "talcahuano", "los ángeles", "chiguayante"
+    ]): return "Biobío"
     elif any(x in t for x in ["temuco", "araucanía", "villarrica", "padre las casas"]): return "Araucanía"
     elif any(x in t for x in ["valdivia", "los ríos", "la unión"]): return "Los Ríos"
     elif any(x in t for x in ["puerto montt", "los lagos", "osorno", "puerto varas", "frutillar"]): return "Los Lagos"
@@ -81,22 +160,29 @@ def deducir_region(texto_full):
 def limpiar_nombre_url(url):
     try:
         slug = url.split("/")[-1].split("?")[0]
-        if not slug: slug = url.split("/")[-2].split("?")[0]
-        slug = slug.replace("Form_", "").replace("form_", "").replace("proyecto-", "").replace("ficha-", "")
+        if not slug:
+            slug = url.split("/")[-2].split("?")[0]
+        slug = slug.replace("Form_", "").replace("form_", "")
+        slug = slug.replace("proyecto-", "").replace("ficha-", "")
         slug = slug.replace("_", " ").replace("-", " ")
         slug = re.sub(r'(\D)(\d)', r'\1 \2', slug)
         return slug.title().strip()
-    except: return "N/A"
+    except:
+        return "N/A"
 
 def separar_palabras_pegadas(texto):
-    if not texto: return ""
+    if not texto:
+        return ""
     return re.sub(r'([a-z])([A-Z])', r'\1 \2', texto)
 
 def es_direccion_invalida(texto):
     t = str(texto).lower()
-    if "apoquindo" in t and "4501" in t: return True
-    if "ventas" in t or "horario" in t or "fono" in t: return True
-    if len(t) < 4: return True
+    if "apoquindo" in t and "4501" in t:
+        return True
+    if "ventas" in t or "horario" in t or "fono" in t:
+        return True
+    if len(t) < 4:
+        return True
     return False
 
 def iniciar_selenium(): 
@@ -107,7 +193,8 @@ def iniciar_selenium():
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
 def limpiar_basura_legal_oval(texto):
-    if not texto: return "N/A"
+    if not texto:
+        return "N/A"
     texto = texto.split('*')[0]
     texto = texto.split('Los bocetos')[0]
     texto = texto.split('Las imágenes')[0]
@@ -117,216 +204,426 @@ def limpiar_basura_legal_oval(texto):
 # MÓDULOS DE EXTRACCIÓN (Requests)
 # ==============================================================================
 
-# 1. EBCO
+# 1. EBCO (sin mapa)
 def modulo_ebco(driver=None):
     links_totales = []
     pagina = 1
     while pagina <= 8:
         try:
-            res = requests.get(f"https://ebco.cl/proyectos/construccion?page={pagina}", headers=HEADERS, verify=False, timeout=10)
-            if res.status_code != 200: break
+            res = requests.get(
+                f"https://ebco.cl/proyectos/construccion?page={pagina}",
+                headers=HEADERS, verify=False, timeout=10
+            )
+            if res.status_code != 200:
+                break
             soup = BeautifulSoup(res.text, 'html.parser')
             links_pag = []
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if "/proyectos/construccion/" in href and "page=" not in href:
-                    if href.strip("/") == "/proyectos/construccion": continue
+                    if href.strip("/") == "/proyectos/construccion":
+                        continue
                     full = "https://ebco.cl" + href if href.startswith("/") else href
                     links_pag.append(full)
-            if not links_pag: break
-            links_totales.extend([l for l in list(set(links_pag)) if l not in links_totales])
+            if not links_pag:
+                break
+            links_totales.extend([l for l in set(links_pag) if l not in links_totales])
             pagina += 1
-        except: break
+        except:
+            break
     
     todos = []
     for url in links_totales:
-        data = {"Inmobiliaria": "CONSTRUCTORA EBCO S.A.", "Obra": "N/A", "Mandante": "", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": url}
+        data = {
+            "Inmobiliaria": "CONSTRUCTORA EBCO S.A.",
+            "Obra": "N/A",
+            "Mandante": "",
+            "Ubicación": "N/A",
+            "Región": "",
+            "Superficie": "",
+            "Latitud": "",
+            "Longitud": "",
+            "Link": url
+        }
         try:
             res = requests.get(url, headers=HEADERS, verify=False, timeout=10)
             soup = BeautifulSoup(res.text, 'html.parser')
-            h1 = soup.find('h1'); data["Obra"] = h1.get_text(strip=True) if h1 else "N/A"
+            h1 = soup.find('h1')
+            data["Obra"] = h1.get_text(strip=True) if h1 else "N/A"
             txt = soup.get_text(" ", strip=True)
-            m_mand = re.search(r"Mandante[:\s]+(.*?)(?=Ubicaci|Superficie|Imágenes|$)", txt, re.IGNORECASE)
-            if m_mand: data["Mandante"] = m_mand.group(1).strip()
-            m_ubi = re.search(r"Ubicaci[oó]n[:\s]+(.*?)(?=Superficie|Mandante|Imágenes|$)", txt, re.IGNORECASE)
-            if m_ubi: 
+            m_mand = re.search(
+                r"Mandante[:\s]+(.*?)(?=Ubicaci|Superficie|Imágenes|$)",
+                txt, re.IGNORECASE
+            )
+            if m_mand:
+                data["Mandante"] = m_mand.group(1).strip()
+            m_ubi = re.search(
+                r"Ubicaci[oó]n[:\s]+(.*?)(?=Superficie|Mandante|Imágenes|$)",
+                txt, re.IGNORECASE
+            )
+            if m_ubi:
                 data["Ubicación"] = m_ubi.group(1).strip()
                 data["Región"] = deducir_region(data["Ubicación"])
-            m_sup = re.search(r"Superficie[:\s]+(.*?)(?=Imágenes|Ubicaci|Mandante|$)", txt, re.IGNORECASE)
-            if m_sup: data["Superficie"] = m_sup.group(1).strip()
+            m_sup = re.search(
+                r"Superficie[:\s]+(.*?)(?=Imágenes|Ubicaci|Mandante|$)",
+                txt, re.IGNORECASE
+            )
+            if m_sup:
+                data["Superficie"] = m_sup.group(1).strip()
             
             # FECHA
             data["Estado/Entrega"] = extraer_fecha_entrega(txt)
-            if "ejecución" in txt.lower(): data["Estado/Entrega"] = "En Ejecución"
+            if "ejecución" in txt.lower():
+                data["Estado/Entrega"] = "En Ejecución"
             
+            # Sin mapa → coords vacías
             todos.append(data)
-        except: pass
+        except:
+            pass
     return todos
 
-# 2. INGEVEC
+# 2. INGEVEC (tiene botón Maps)
 def modulo_ingevec(driver=None):
     try:
-        res = requests.get("https://ingevecinmobiliaria.cl/proyectos-en-venta", headers=HEADERS, verify=False, timeout=15)
+        res = requests.get(
+            "https://ingevecinmobiliaria.cl/proyectos-en-venta",
+            headers=HEADERS, verify=False, timeout=15
+        )
         soup = BeautifulSoup(res.text, 'html.parser')
         links = []
         for a in soup.find_all('a', href=True):
             h = a['href'].lower()
-            if "ver proyecto" in a.get_text(" ", strip=True).lower() or "proyecto" in h or "ficha" in h or "form_" in h:
-                if any(x in h for x in ["whatsapp", "facebook", "maps", "mailto"]): continue
-                if "proyectos-en-venta" in h: continue
+            if (
+                "ver proyecto" in a.get_text(" ", strip=True).lower()
+                or "proyecto" in h or "ficha" in h or "form_" in h
+            ):
+                if any(x in h for x in ["whatsapp", "facebook", "maps", "mailto"]):
+                    continue
+                if "proyectos-en-venta" in h:
+                    continue
                 full = "https://ingevecinmobiliaria.cl" + a['href'] if a['href'].startswith("/") else a['href']
-                if full.startswith("http"): links.append(full)
+                if full.startswith("http"):
+                    links.append(full)
         todos = []
-        for url in list(set(links)):
-            d = {"Inmobiliaria": "INMOBILIARIA Y CONSTRUCTORA INGEVEC S.A", "Obra": "N/A", "Mandante": "INGEVEC", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": url}
+        for url in set(links):
+            d = {
+                "Inmobiliaria": "INMOBILIARIA Y CONSTRUCTORA INGEVEC S.A",
+                "Obra": "N/A",
+                "Mandante": "INGEVEC",
+                "Ubicación": "N/A",
+                "Región": "",
+                "Superficie": "",
+                "Latitud": "",
+                "Longitud": "",
+                "Link": url
+            }
             try:
                 r = requests.get(url, headers=HEADERS, verify=False, timeout=10)
                 s = BeautifulSoup(r.text, 'html.parser')
                 t = s.get_text(" ", strip=True)
-                pat = {"Obra": r"Nombre[:\s]+(.*?)(?=Direcci|Dormitorios|$)", "Ubicación": r"Direcci[oó]n[:\s]+(.*?)(?=Dormitorios|Baños|Superficie|$)", "Superficie": r"Superficie total[:\s]+(.*?)(?=Estac|Estado|$)"}
-                for k,v in pat.items():
+                pat = {
+                    "Obra": r"Nombre[:\s]+(.*?)(?=Direcci|Dormitorios|$)",
+                    "Ubicación": r"Direcci[oó]n[:\s]+(.*?)(?=Dormitorios|Baños|Superficie|$)",
+                    "Superficie": r"Superficie total[:\s]+(.*?)(?=Estac|Estado|$)"
+                }
+                for k, v in pat.items():
                     m = re.search(v, t, re.IGNORECASE)
-                    if m: d[k] = m.group(1).strip()[:100]
+                    if m:
+                        d[k] = m.group(1).strip()[:100]
                 if d["Ubicación"] == "N/A":
                     for a in s.find_all('a', href=True):
                         if "maps" in a['href'] or "waze" in a['href']:
                             tx = a.get_text(strip=True)
-                            if len(tx)>5 and any(c.isdigit() for c in tx) and "mapa" not in tx.lower():
-                                d["Ubicación"] = tx; break
-                if d["Obra"] != "N/A": d["Obra"] = separar_palabras_pegadas(d["Obra"])
-                if d["Obra"] == "N/A" or any(m in d["Obra"].lower() for m in ["conectividad", "entrega", "ganadora"]):
+                            if (
+                                len(tx) > 5
+                                and any(c.isdigit() for c in tx)
+                                and "mapa" not in tx.lower()
+                            ):
+                                d["Ubicación"] = tx
+                                break
+                if d["Obra"] != "N/A":
+                    d["Obra"] = separar_palabras_pegadas(d["Obra"])
+                if d["Obra"] == "N/A" or any(
+                    m in d["Obra"].lower()
+                    for m in ["conectividad", "entrega", "ganadora"]
+                ):
                     d["Obra"] = limpiar_nombre_url(url)
-                if not d["Región"]: d["Región"] = deducir_region(d["Ubicación"] + " " + d["Obra"])
+                if not d["Región"]:
+                    d["Región"] = deducir_region(d["Ubicación"] + " " + d["Obra"])
                 
                 # FECHA
                 d["Estado/Entrega"] = extraer_fecha_entrega(t)
+
+                # COORDENADAS
+                lat, lon = extraer_coordenadas_desde_mapas(s)
+                d["Latitud"] = lat or ""
+                d["Longitud"] = lon or ""
                 
                 todos.append(d)
-            except: pass
+            except:
+                pass
         return todos
-    except: return []
+    except:
+        return []
 
-# 3. SOCOVESA
+# 3. SOCOVESA (Leaflet + botón Maps)
 def modulo_socovesa(driver=None):
     links_totales = []
     pagina = 1
     while pagina <= 10:
         try:
-            res = requests.get(f"https://www.socovesa.cl/buscador-proyectos/?ciudad=&comuna=&tipologia=&paged={pagina}", headers=HEADERS, verify=False, timeout=15)
-            if res.status_code != 200: break
+            res = requests.get(
+                f"https://www.socovesa.cl/buscador-proyectos/?ciudad=&comuna=&tipologia=&paged={pagina}",
+                headers=HEADERS, verify=False, timeout=15
+            )
+            if res.status_code != 200:
+                break
             soup = BeautifulSoup(res.text, 'html.parser')
             links_pag = []
             for a in soup.find_all('a', href=True):
                 if "/nuestros-proyectos/" in a['href'] and "page" not in a['href']:
                     href = a['href']
-                    if href == "https://www.socovesa.cl/nuestros-proyectos/": continue
+                    if href == "https://www.socovesa.cl/nuestros-proyectos/":
+                        continue
                     full = "https://www.socovesa.cl" + href if href.startswith("/") else href
                     links_pag.append(full)
-            if not links_pag: break
-            links_totales.extend([l for l in list(set(links_pag)) if l not in links_totales])
+            if not links_pag:
+                break
+            links_totales.extend([l for l in set(links_pag) if l not in links_totales])
             pagina += 1
-        except: break
+        except Exception as e:
+            print("Error listado SOCOVESA página", pagina, ":", e)
+            break
+
     todos = []
     for url in links_totales:
-        data = {"Inmobiliaria": "SOCOVESA INMOBILIARIA Y CONSTRUCCIONES", "Obra": "N/A", "Mandante": "SOCOVESA", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": url}
+        data = {
+            "Inmobiliaria": "SOCOVESA INMOBILIARIA Y CONSTRUCCIONES",
+            "Obra": "N/A",
+            "Mandante": "SOCOVESA",
+            "Ubicación": "N/A",
+            "Región": "",
+            "Superficie": "",
+            "Latitud": "",
+            "Longitud": "",
+            "Link": url
+        }
         try:
+            # ficha de proyecto
             res = requests.get(url, headers=HEADERS, verify=False, timeout=10)
             soup = BeautifulSoup(res.text, 'html.parser')
             txt = soup.get_text(" ", strip=True)
+
+            # nombre (h1)
             h1 = soup.find('h1')
-            if h1: data["Obra"] = h1.get_text(strip=True)
-            match_dir = re.search(r"Direcci[oó]n[:\s]+(.*?)(?=Abrir|Waze|Google|$)", txt, re.IGNORECASE)
-            if match_dir: data["Ubicación"] = match_dir.group(1).strip()
-            elif "Entrega" in txt:
-                 match_geo = re.search(r"(Entrega|Venta).*?,(.*?),(.*?)$", txt, re.MULTILINE)
-                 if match_geo: data["Ubicación"] = f"{match_geo.group(2)}, {match_geo.group(3)}".strip()
-            match_sup = re.search(r"Superficie[:\s]+(\d+[\.,]?\d*\s*m2?)", txt, re.IGNORECASE)
-            if match_sup: data["Superficie"] = match_sup.group(1)
-            if not data["Región"]: data["Región"] = deducir_region(data["Ubicación"] + " " + txt)
-            
-            # FECHA
+            if h1:
+                data["Obra"] = h1.get_text(strip=True)
+
+            # dirección
+            match_dir = re.search(
+                r"Direcci[oó]n[:\s]+(.*?)(?=Abrir|Waze|Google|$)",
+                txt, re.IGNORECASE
+            )
+            if match_dir:
+                data["Ubicación"] = match_dir.group(1).strip()
+            else:
+                # fallback simple: algún texto con coma que parezca dirección
+                loc_div = soup.find('div', class_=re.compile("box__address|direccion", re.IGNORECASE))
+                if loc_div:
+                    cand = loc_div.get_text(" ", strip=True)
+                    if len(cand) > 5:
+                        data["Ubicación"] = cand
+
+            # superficie si aparece en texto
+            match_sup = re.search(
+                r"Superficie[:\s]+(\d+[\.,]?\d*\s*m2?)",
+                txt, re.IGNORECASE
+            )
+            if match_sup:
+                data["Superficie"] = match_sup.group(1)
+
+            # región
+            if not data["Región"]:
+                data["Región"] = deducir_region(data["Ubicación"] + " " + txt)
+
+            # estado / entrega
             data["Estado/Entrega"] = extraer_fecha_entrega(txt)
-            
+
+            # COORDENADAS: primero data-lat/data-lng, luego Waze/Maps
+            lat, lon = extraer_coordenadas_desde_mapas(soup)
+            data["Latitud"] = lat or ""
+            data["Longitud"] = lon or ""
+
+            # DEBUG opcional
+            # print("SOCOVESA:", data["Obra"], "→", data["Latitud"], data["Longitud"])
+
             todos.append(data)
-        except: pass
+
+        except Exception as e:
+            print("Error ficha SOCOVESA:", url, e)
+            continue
+
     return todos
 
-# 4. POCURO
+# 4. POCURO (versión de prueba con prints)
 def modulo_pocuro(driver):
     todos = []
     try:
         driver.get("https://www.pocuro.cl/proyectos")
-        time.sleep(3)
+        time.sleep(4)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        time.sleep(3)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         tarjetas = soup.find_all('a', class_="card-proyecto")
-        if not tarjetas: tarjetas = soup.find_all('a', href=True)
+        if not tarjetas:
+            tarjetas = soup.find_all('a', href=True)
         links = []
         for card in tarjetas:
             href = card.get('href')
             if href and "/proyecto/" in href:
-                links.append("https://www.pocuro.cl" + href if href.startswith("/") else href)
+                links.append(
+                    "https://www.pocuro.cl" + href if href.startswith("/") else href
+                )
+
         for link in list(set(links)):
             try:
-                driver.get(link); time.sleep(1)
+                driver.get(link)
+                time.sleep(4)  # dejar cargar mapa/botones
                 s = BeautifulSoup(driver.page_source, 'html.parser')
                 t = s.get_text(" ", strip=True)
-                d = {"Inmobiliaria": "CONSTRUCTORA POCURO SPA", "Obra": "N/A", "Mandante": "POCURO", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": link}
+
+                d = {
+                    "Inmobiliaria": "CONSTRUCTORA POCURO SPA",
+                    "Obra": "N/A",
+                    "Mandante": "POCURO",
+                    "Ubicación": "N/A",
+                    "Región": "",
+                    "Superficie": "",
+                    "Latitud": "",
+                    "Longitud": "",
+                    "Link": link
+                }
+
                 h1 = s.find('h1')
                 d["Obra"] = h1.get_text(strip=True) if h1 else limpiar_nombre_url(link)
-                m_dir = re.search(r"Direcci[oó]n[:\s]+(.*?)(?=Informaci|Hospital|Colegio|$)", t, re.IGNORECASE)
-                if m_dir: d["Ubicación"] = m_dir.group(1).strip().split("Abrir")[0]
-                m_sup = re.search(r"(\d+[\.,]?\d*\s*m²?)", t, re.IGNORECASE)
-                if m_sup and float(m_sup.group(1).lower().replace("m²","").replace("m2","").replace(",",".")) > 20: d["Superficie"] = m_sup.group(1)
-                d["Región"] = deducir_region(d["Ubicación"] + " " + t)
-                
-                # FECHA
-                d["Estado/Entrega"] = extraer_fecha_entrega(t)
-                
-                todos.append(d)
-            except: continue
-        return todos
-    except: return []
 
-# 5. OVAL
+                m_dir = re.search(
+                    r"Direcci[oó]n[:\s]+(.*?)(?=Informaci|Hospital|Colegio|$)",
+                    t, re.IGNORECASE
+                )
+                if m_dir:
+                    d["Ubicación"] = m_dir.group(1).strip().split("Abrir")[0]
+
+                m_sup = re.search(r"(\d+[\.,]?\d*\s*m²?)", t, re.IGNORECASE)
+                if m_sup:
+                    try:
+                        val = float(
+                            m_sup.group(1).lower()
+                            .replace("m²", "").replace("m2", "").replace(",", ".")
+                        )
+                        if val > 20:
+                            d["Superficie"] = m_sup.group(1)
+                    except:
+                        pass
+
+                d["Región"] = deducir_region(d["Ubicación"] + " " + t)
+
+                d["Estado/Entrega"] = extraer_fecha_entrega(t)
+
+                # COORDENADAS (DEBUG)
+                lat, lon = extraer_coordenadas_desde_mapas(s)
+                d["Latitud"] = lat or ""
+                d["Longitud"] = lon or ""
+
+                print("POCURO:", d["Obra"], "→", d["Latitud"], d["Longitud"])  # DEBUG
+
+                todos.append(d)
+            except Exception as e:
+                print("Error en ficha POCURO:", link, e)
+                continue
+
+        return todos
+    except Exception as e:
+        print("Error en listado POCURO:", e)
+        return []
+# 5. OVAL (sin mapa)
 def modulo_oval(driver=None):
     try:
-        res = requests.get("https://www.constructoraoval.cl/proyectos/", headers=HEADERS, verify=False, timeout=15)
+        res = requests.get(
+            "https://www.constructoraoval.cl/proyectos/",
+            headers=HEADERS, verify=False, timeout=15
+        )
         soup = BeautifulSoup(res.text, 'html.parser')
-        links = list(set([btn.get('href') for btn in soup.find_all('a', string="Ver proyecto") if btn.get('href')]))
+        links = list(set([
+            btn.get('href')
+            for btn in soup.find_all('a', string="Ver proyecto")
+            if btn.get('href')
+        ]))
         todos = []
         for url in links:
-            d = {"Inmobiliaria": "CONSTRUCTORA OVAL", "Obra": "N/A", "Mandante": "OVAL", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": url}
+            d = {
+                "Inmobiliaria": "CONSTRUCTORA OVAL",
+                "Obra": "N/A",
+                "Mandante": "OVAL",
+                "Ubicación": "N/A",
+                "Región": "",
+                "Superficie": "",
+                "Latitud": "",
+                "Longitud": "",
+                "Link": url
+            }
             try:
                 r = requests.get(url, headers=HEADERS, verify=False, timeout=10)
                 s = BeautifulSoup(r.text, 'html.parser')
                 t = s.get_text(" ", strip=True)
-                m_o = re.search(r"Obra[:\s]+(.*?)(?=Unidades|Destino|$)", t, re.IGNORECASE); 
-                if m_o: d["Obra"] = m_o.group(1).strip()
-                elif s.find('h1'): d["Obra"] = s.find('h1').get_text(strip=True)
-                m_u = re.search(r"Ubicaci[oó]n[:\s]+(.*?)(?=Regi|Mandante|$)", t, re.IGNORECASE); 
-                if m_u: d["Ubicación"] = m_u.group(1).strip()
+                m_o = re.search(
+                    r"Obra[:\s]+(.*?)(?=Unidades|Destino|$)",
+                    t, re.IGNORECASE
+                )
+                if m_o:
+                    d["Obra"] = m_o.group(1).strip()
+                elif s.find('h1'):
+                    d["Obra"] = s.find('h1').get_text(strip=True)
+                m_u = re.search(
+                    r"Ubicaci[oó]n[:\s]+(.*?)(?=Regi|Mandante|$)",
+                    t, re.IGNORECASE
+                )
+                if m_u:
+                    d["Ubicación"] = m_u.group(1).strip()
                 
                 # FIX OVAL EXCLUSIVO
-                m_r = re.search(r"Regi[oó]n[:\s]+(.*?)(?=Previous|Next|$)", t, re.IGNORECASE); 
-                if m_r: d["Región"] = limpiar_basura_legal_oval(m_r.group(1))
+                m_r = re.search(
+                    r"Regi[oó]n[:\s]+(.*?)(?=Previous|Next|$)",
+                    t, re.IGNORECASE
+                )
+                if m_r:
+                    d["Región"] = limpiar_basura_legal_oval(m_r.group(1))
                 
-                m_s = re.search(r"Superficie edificada[:\s]+(.*?)(?=Mandante|Destino|$)", t, re.IGNORECASE); 
-                if m_s: d["Superficie"] = m_s.group(1).strip()
+                m_s = re.search(
+                    r"Superficie edificada[:\s]+(.*?)(?=Mandante|Destino|$)",
+                    t, re.IGNORECASE
+                )
+                if m_s:
+                    d["Superficie"] = m_s.group(1).strip()
                 
                 # FECHA
                 d["Estado/Entrega"] = extraer_fecha_entrega(t)
-                
-                todos.append(d)
-            except: pass
-        return todos
-    except: return []
 
-# 6. PACAL
+                # Sin mapa → coords vacías (se pueden llenar luego por geocoding/INT)
+                todos.append(d)
+            except:
+                pass
+        return todos
+    except:
+        return []
+
+# 6. PACAL (botón Google Maps)
 def modulo_pacal(driver=None):
     try:
-        res = requests.get("https://pacal.cl/proyectos-pacal/", headers=HEADERS, verify=False, timeout=15)
+        res = requests.get(
+            "https://pacal.cl/proyectos-pacal/",
+            headers=HEADERS, verify=False, timeout=15
+        )
         soup = BeautifulSoup(res.text, 'html.parser')
         todos_datos = []
         parrafos = soup.find_all('p')
@@ -334,224 +631,466 @@ def modulo_pacal(driver=None):
             txt = p.get_text(" ", strip=True)
             if "Dirección" in txt and "Ciudad" in txt:
                 try:
-                    data = {"Inmobiliaria": "CONSTRUCTORA PACAL S.A", "Obra": "N/A", "Mandante": "PACAL", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": "https://pacal.cl/proyectos-pacal/"}
-                    match_dir = re.search(r"Dirección\s*:\s*(.*?)(?=Ciudad|$)", txt, re.IGNORECASE)
-                    if match_dir: data["Ubicación"] = match_dir.group(1).strip()
-                    match_ciu = re.search(r"Ciudad\s*:\s*(.*?)(?=\+56|Tel|Ver|$)", txt, re.IGNORECASE)
+                    data = {
+                        "Inmobiliaria": "CONSTRUCTORA PACAL S.A",
+                        "Obra": "N/A",
+                        "Mandante": "PACAL",
+                        "Ubicación": "N/A",
+                        "Región": "",
+                        "Superficie": "",
+                        "Latitud": "",
+                        "Longitud": "",
+                        "Link": "https://pacal.cl/proyectos-pacal/"
+                    }
+                    match_dir = re.search(
+                        r"Dirección\s*:\s*(.*?)(?=Ciudad|$)",
+                        txt, re.IGNORECASE
+                    )
+                    if match_dir:
+                        data["Ubicación"] = match_dir.group(1).strip()
+                    match_ciu = re.search(
+                        r"Ciudad\s*:\s*(.*?)(?=\+56|Tel|Ver|$)",
+                        txt, re.IGNORECASE
+                    )
                     if match_ciu:
                         c = match_ciu.group(1).strip()
                         data["Región"] = deducir_region(c)
-                        if not data["Región"]: data["Región"] = c
+                        if not data["Región"]:
+                            data["Región"] = c
                     prev_a = p.find_previous('a', href=True)
                     i = 0
                     while prev_a and i < 5:
                         t_lnk = prev_a.get_text(strip=True)
-                        if t_lnk and len(t_lnk)>3 and "constructora" not in t_lnk.lower():
-                            data["Obra"] = t_lnk.replace("Condominio", "").replace("Edificio", "").strip()
+                        if (
+                            t_lnk and len(t_lnk) > 3
+                            and "constructora" not in t_lnk.lower()
+                        ):
+                            data["Obra"] = (
+                                t_lnk.replace("Condominio", "")
+                                .replace("Edificio", "").strip()
+                            )
                             data["Link"] = prev_a['href']
                             break
-                        prev_a = prev_a.find_previous('a', href=True); i+=1
+                        prev_a = prev_a.find_previous('a', href=True)
+                        i += 1
                     
-                    # FECHA (Pacal la suele poner en otro <p> cercano, pero usaremos el radar)
+                    # FECHA
                     data["Estado/Entrega"] = extraer_fecha_entrega(txt)
+
+                    # COORDENADAS desde Maps
+                    lat, lon = extraer_coordenadas_desde_mapas(soup)
+                    data["Latitud"] = lat or ""
+                    data["Longitud"] = lon or ""
                     
                     todos_datos.append(data)
-                except: continue
-        seen = set(); uniq = []
+                except:
+                    continue
+        seen = set()
+        uniq = []
         for d in todos_datos:
-            if d['Obra'] not in seen and d['Obra']!="N/A": uniq.append(d); seen.add(d['Obra'])
+            if d['Obra'] not in seen and d['Obra'] != "N/A":
+                uniq.append(d)
+                seen.add(d['Obra'])
         return uniq
-    except: return []
+    except:
+        return []
 
-# 7. SANTOLAYA
+# 7. SANTOLAYA (ventanita Leaflet + mapa en listado)
 def modulo_santolaya(driver):
     url = "https://santolaya.cl/proyectos-venta"
     todos = []
     try:
+        # 1) Listado general
         driver.get(url)
-        time.sleep(3)
+        time.sleep(4)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        time.sleep(3)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        # Botones "VER PROYECTO" como en tu versión original
         btns = soup.find_all('a', class_=re.compile("btnVerProyecto"))
-        if not btns: btns = soup.find_all('a', string=re.compile("VER PROYECTO", re.IGNORECASE))
-        
+        if not btns:
+            btns = soup.find_all('a', string=re.compile("VER PROYECTO", re.IGNORECASE))
+
+        # Construir lista (link, nombre_listado, ubicacion_listado, superficie_listado)
+        items = []
         for btn in btns:
             try:
-                data = {"Inmobiliaria": "CONSTRUCTORA SANTOLAYA", "Obra": "N/A", "Mandante": "SANTOLAYA", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": url}
                 href = btn.get('href')
-                if href: data["Link"] = "https://santolaya.cl/" + href.strip("/")
+                if not href:
+                    continue
+                link_ficha = "https://santolaya.cl/" + href.strip("/")
+
+                # Nombre desde el listado (como antes)
                 nom = btn.find_previous('p', class_=re.compile("size18"))
-                if nom: data["Obra"] = nom.get_text(" ", strip=True).replace("Edificio", "").strip()
-                ubi = btn.find_previous('p', class_=re.compile("size13"))
-                if ubi: data["Ubicación"] = ubi.get_text(strip=True)
-                data["Región"] = deducir_region(data["Ubicación"])
-                sup = btn.find_previous(string=re.compile("M2", re.IGNORECASE))
-                if sup: 
-                    m = re.search(r"(\d+.*?[mM]2)", sup)
-                    if m: data["Superficie"] = m.group(1)
-                
-                # FECHA
-                banner = btn.find_previous(string=re.compile("Entrega|Nuevo", re.IGNORECASE))
-                if banner: data["Estado/Entrega"] = banner.strip()
-                else: data["Estado/Entrega"] = "Consultar"
+                obra_listado = ""
+                if nom:
+                    obra_listado = nom.get_text(" ", strip=True).replace("Edificio", "").strip()
+
+                # Ubicación desde el listado
+                ubi_p = btn.find_previous('p', class_=re.compile("size13"))
+                ubi_listado = ""
+                if ubi_p:
+                    ubi_listado = ubi_p.get_text(strip=True)
+
+                # Superficie aproximada desde el listado (si aparece texto con M2)
+                sup_txt = btn.find_previous(string=re.compile("M2", re.IGNORECASE))
+                sup_listado = ""
+                if sup_txt:
+                    m = re.search(r"(\d+.*?[mM]2)", sup_txt)
+                    if m:
+                        sup_listado = m.group(1)
+
+                items.append((link_ficha, obra_listado, ubi_listado, sup_listado))
+            except:
+                continue
+
+        # 2) Recorrer cada ficha para completar datos + coordenadas
+        for link_ficha, obra_listado, ubi_listado, sup_listado in items:
+            try:
+                driver.get(link_ficha)
+                time.sleep(4)
+                s = BeautifulSoup(driver.page_source, 'html.parser')
+                t = s.get_text(" ", strip=True)
+
+                data = {
+                    "Inmobiliaria": "CONSTRUCTORA SANTOLAYA",
+                    "Obra": obra_listado or "N/A",
+                    "Mandante": "SANTOLAYA",
+                    "Ubicación": ubi_listado or "N/A",
+                    "Región": "",
+                    "Superficie": sup_listado or "",
+                    "Latitud": "",
+                    "Longitud": "",
+                    "Link": link_ficha
+                }
+
+                # Intentar mejorar nombre desde la ficha (si hay h1)
+                h1 = s.find('h1')
+                if h1:
+                    data["Obra"] = h1.get_text(" ", strip=True).replace("Edificio", "").strip()
+
+                # Si en la ficha aparece una dirección más precisa, la usamos
+                # (se puede ajustar este patrón si ves otra estructura)
+                loc_p = s.find('p', class_=re.compile("size15|size13"))
+                if loc_p and "img src=\"/images/icon/location.svg" in str(loc_p):
+                    txt_loc = loc_p.get_text(" ", strip=True)
+                    if len(txt_loc) > 5:
+                        data["Ubicación"] = txt_loc
+
+                # Región a partir de ubicación + texto general
+                data["Región"] = deducir_region(data["Ubicación"] + " " + t)
+
+                # Superficie: si no vino del listado, intentar en la ficha
+                if not data["Superficie"]:
+                    sup_txt2 = s.find(string=re.compile("m2", re.IGNORECASE))
+                    if sup_txt2:
+                        m2 = re.search(r"(\d+.*?[mM]2)", sup_txt2)
+                        if m2:
+                            data["Superficie"] = m2.group(1)
+
+                # FECHA / estado
+                data["Estado/Entrega"] = extraer_fecha_entrega(t)
+
+                # COORDENADAS desde enlaces Maps/Waze
+                lat, lon = extraer_coordenadas_desde_mapas(s)
+                data["Latitud"] = lat or ""
+                data["Longitud"] = lon or ""
+
+                # DEBUG opcional
+                # print("SANTOLAYA:", data["Obra"], "→", data["Latitud"], data["Longitud"])
 
                 todos.append(data)
-            except: continue
-        seen = set(); uniq = []
-        for d in todos:
-            if d['Obra'] not in seen: uniq.append(d); seen.add(d['Obra'])
-        return uniq
-    except: return []
 
-# 8. GUZMAN Y LARRAIN
+            except Exception as e:
+                print("Error ficha SANTOLAYA:", link_ficha, e)
+                continue
+
+        # Eliminar duplicados por Obra
+        seen = set()
+        uniq = []
+        for d in todos:
+            if d['Obra'] not in seen:
+                uniq.append(d)
+                seen.add(d['Obra'])
+        return uniq
+
+    except Exception as e:
+        print("Error listado SANTOLAYA:", e)
+        return []
+
+# 8. GUZMAN Y LARRAIN (Leaflet + botón Waze)
 def modulo_guzman(driver):
     url = "https://www.guzmanylarrain.com/proyectos/venta"
     proyectos = []
     try:
         driver.get(url)
         time.sleep(4)
-        for i in range(2): driver.execute_script("window.scrollTo(0, document.body.scrollHeight);"); time.sleep(1)
+        for _ in range(2):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         tarjetas = soup.find_all('a', class_="bxPrList")
         for tarjeta in tarjetas:
             try:
-                href = tarjeta.get('href'); 
-                if not href: continue
-                full_link = "https://www.guzmanylarrain.com" + href if href.startswith("/") else href
-                data = {"Inmobiliaria": "CONSTRUCTORA GUZMAN Y LARRAI\u00ADN LTDA.", "Obra": "N/A", "Mandante": "GyL", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": full_link}
-                h4 = tarjeta.find('h4'); data["Obra"] = h4.get_text(strip=True) if h4 else "N/A"
+                href = tarjeta.get('href')
+                if not href:
+                    continue
+                full_link = (
+                    "https://www.guzmanylarrain.com" + href
+                    if href.startswith("/") else href
+                )
+                data = {
+                    "Inmobiliaria": "CONSTRUCTORA GUZMAN Y LARRAI\u00ADN LTDA.",
+                    "Obra": "N/A",
+                    "Mandante": "GyL",
+                    "Ubicación": "N/A",
+                    "Región": "",
+                    "Superficie": "",
+                    "Latitud": "",
+                    "Longitud": "",
+                    "Link": full_link
+                }
+                h4 = tarjeta.find('h4')
+                data["Obra"] = h4.get_text(strip=True) if h4 else "N/A"
                 ci = tarjeta.find('div', class_="titCiudad")
-                if ci: 
-                    c = ci.get_text(strip=True); data["Región"] = deducir_region(c); data["Ubicación"] = c
+                if ci:
+                    c = ci.get_text(strip=True)
+                    data["Región"] = deducir_region(c)
+                    data["Ubicación"] = c
                 txt_card = tarjeta.get_text(" ", strip=True)
                 m = re.search(r"(\d+[\.,]?\d*)\s*m²", txt_card)
-                if m: data["Superficie"] = f"{m.group(0)}"
+                if m:
+                    data["Superficie"] = m.group(0)
                 
                 # FECHA
                 data["Estado/Entrega"] = extraer_fecha_entrega(txt_card)
                 
                 proyectos.append(data)
-            except: continue
-    except: return []
+            except:
+                continue
+    except:
+        return []
     finales = []
     for p in proyectos:
         try:
-            driver.get(p['Link']); time.sleep(1.5)
+            driver.get(p['Link'])
+            time.sleep(1.5)
             s = BeautifulSoup(driver.page_source, 'html.parser')
             icons = s.find_all('i', class_=re.compile("icn-moon|icon-location"))
             found = False
             for ic in icons:
                 par = ic.find_parent('p')
-                if par: 
+                if par:
                     txt = par.get_text(strip=True)
-                    if len(txt)>5 and any(c.isdigit() for c in txt): 
-                        p["Ubicación"] = txt; found = True; break
+                    if len(txt) > 5 and any(c.isdigit() for c in txt):
+                        p["Ubicación"] = txt
+                        found = True
+                        break
             if not found:
                 txt_det = s.get_text(" ", strip=True)
-                m = re.search(r"Direcci[oó]n\s*[:\.]?\s*(.*?)(?=Horario|Teléfono|$)", txt_det, re.IGNORECASE)
-                if m: p["Ubicación"] = m.group(1).strip()
+                m = re.search(
+                    r"Direcci[oó]n\s*[:\.]?\s*(.*?)(?=Horario|Teléfono|$)",
+                    txt_det, re.IGNORECASE
+                )
+                if m:
+                    p["Ubicación"] = m.group(1).strip()
+
+            # COORDENADAS desde Waze/Maps/Leaflet
+            lat, lon = extraer_coordenadas_desde_mapas(s)
+            p["Latitud"] = lat or ""
+            p["Longitud"] = lon or ""
+
             finales.append(p)
-        except: finales.append(p)
+        except:
+            finales.append(p)
     return finales
 
-# 9. PAZ
+# 9. PAZ (Google Maps)
 def modulo_paz(driver):
     url = "https://www.paz.cl/resultado-busqueda"
     base = []
     try:
-        driver.get(url); time.sleep(5)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);"); time.sleep(3)
+        driver.get(url)
+        time.sleep(5)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(3)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         tarjetas = soup.find_all('div', class_="paddColsProy")
         for c in tarjetas:
             try:
                 lnk = c.find('a', class_="linkProyecto")
-                if not lnk: continue
-                full = "https://www.paz.cl" + lnk.get('href') if lnk.get('href').startswith("/") else lnk.get('href')
-                d = {"Inmobiliaria": "CONSTRUCTORA PAZ SPA", "Obra": "N/A", "Mandante": "PAZ", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": full}
-                nm = c.find('div', class_="NombreProyecto"); d["Obra"] = nm.get_text(strip=True) if nm else "N/A"
-                co = c.find('div', class_="ComunaProyecto"); 
-                if co: 
-                    tc = co.get_text(strip=True); d["Región"] = deducir_region(tc); d["_backup"] = tc
-                    if not d["Región"]: d["Región"] = tc
-                if d["Obra"]!="N/A" and any(x.isdigit() for x in d["Obra"]) and "etapa" not in d["Obra"].lower(): d["Ubicación"] = d["Obra"].title()
-                
-                # FECHA
+                if not lnk:
+                    continue
+                full = (
+                    "https://www.paz.cl" + lnk.get('href')
+                    if lnk.get('href').startswith("/") else lnk.get('href')
+                )
+                d = {
+                    "Inmobiliaria": "CONSTRUCTORA PAZ SPA",
+                    "Obra": "N/A",
+                    "Mandante": "PAZ",
+                    "Ubicación": "N/A",
+                    "Región": "",
+                    "Superficie": "",
+                    "Latitud": "",
+                    "Longitud": "",
+                    "Link": full
+                }
+                nm = c.find('div', class_="NombreProyecto")
+                d["Obra"] = nm.get_text(strip=True) if nm else "N/A"
+                co = c.find('div', class_="ComunaProyecto")
+                if co:
+                    tc = co.get_text(strip=True)
+                    d["Región"] = deducir_region(tc)
+                    d["_backup"] = tc
+                    if not d["Región"]:
+                        d["Región"] = tc
+                if (
+                    d["Obra"] != "N/A"
+                    and any(x.isdigit() for x in d["Obra"])
+                    and "etapa" not in d["Obra"].lower()
+                ):
+                    d["Ubicación"] = d["Obra"].title()
                 txt_card = c.get_text(" ", strip=True)
                 d["Estado/Entrega"] = extraer_fecha_entrega(txt_card)
-                
                 base.append(d)
-            except: continue
-    except: return []
+            except:
+                continue
+    except:
+        return []
+
     finales = []
     for p in base:
-        if p["Ubicación"] != "N/A": finales.append(p); continue
         try:
-            driver.get(p['Link']); time.sleep(1.5)
+            driver.get(p['Link'])
+            time.sleep(3)
             s = BeautifulSoup(driver.page_source, 'html.parser')
-            cand = "N/A"
+
+            # Ubicación más precisa desde ficha
+            cand = p.get("Ubicación", "N/A")
             sp = s.find_all('span', class_="direccionProyecto")
             for x in sp:
                 t = x.get_text(strip=True)
-                if len(t)>4 and not es_direccion_invalida(t): cand=t; break
+                if len(t) > 4 and not es_direccion_invalida(t):
+                    cand = t
+                    break
             if es_direccion_invalida(cand):
                 lb = s.find(string=re.compile("Dirección Edificio", re.IGNORECASE))
-                if lb and lb.parent: cand = lb.parent.get_text(" ", strip=True).replace("Dirección Edificio:", "").strip()
+                if lb and lb.parent:
+                    cand = (
+                        lb.parent.get_text(" ", strip=True)
+                        .replace("Dirección Edificio:", "").strip()
+                    )
             if es_direccion_invalida(cand):
-                m = re.search(r"(Av\.|Avenida|Calle|Pasaje)\s+[A-ZÁÉÍÓÚÑa-z\s\.]+\d+", s.get_text(" ", strip=True))
-                if m: cand = m.group(0)
-            
-            if es_direccion_invalida(cand): cand = "N/A"
+                m = re.search(
+                    r"(Av\.|Avenida|Calle|Pasaje)\s+[A-ZÁÉÍÓÚÑa-z\s\.]+\d+",
+                    s.get_text(" ", strip=True)
+                )
+                if m:
+                    cand = m.group(0)
+            if es_direccion_invalida(cand):
+                cand = "N/A"
             p["Ubicación"] = cand if cand != "N/A" else p.get("_backup", "N/A")
-            if "_backup" in p: del p["_backup"]
+            if "_backup" in p:
+                del p["_backup"]
+
+            # COORDENADAS: intentamos en toda la ficha
+            # - enlaces maps.google.com/maps?ll=... (casos donde existen)
+            # - iframes (por si algún día incluyen @lat,lon)
+            lat, lon = extraer_coordenadas_desde_mapas(s)
+            p["Latitud"] = lat or ""
+            p["Longitud"] = lon or ""
+
+            # DEBUG opcional
+            # print("PAZ:", p["Obra"], "→", p["Latitud"], p["Longitud"])
+
             finales.append(p)
-        except: finales.append(p)
+        except:
+            if "_backup" in p:
+                del p["_backup"]
+            finales.append(p)
+
     return finales
 
-# 10. CARRAN
+# 10. CARRAN (sin mapa)
 def modulo_carran(driver):
     try:
         driver.get("https://www.constructoracarran.cl/")
-        time.sleep(4); driver.execute_script("window.scrollTo(0, document.body.scrollHeight);"); time.sleep(3)
+        time.sleep(4)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(3)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         tarjetas = soup.find_all('article', class_="project-card")
         todos = []
         for card in tarjetas:
             try:
-                data = {"Inmobiliaria": "CONSTRUCTORA CARRAN S.A", "Obra": "N/A", "Mandante": "CARRAN", "Ubicación": "N/A", "Región": "", "Superficie": "", "Link": "https://www.constructoracarran.cl/#proyectos"}
+                data = {
+                    "Inmobiliaria": "CONSTRUCTORA CARRAN S.A",
+                    "Obra": "N/A",
+                    "Mandante": "CARRAN",
+                    "Ubicación": "N/A",
+                    "Región": "",
+                    "Superficie": "",
+                    "Latitud": "",
+                    "Longitud": "",
+                    "Link": "https://www.constructoracarran.cl/#proyectos"
+                }
                 titulo = card.find('h3', class_="project-card__title")
-                if titulo: data["Obra"] = titulo.get_text(strip=True)
+                if titulo:
+                    data["Obra"] = titulo.get_text(strip=True)
                 loc = card.find('p', class_="project-card__location")
                 if loc:
-                    tl = loc.get_text(strip=True); data["Ubicación"] = tl; data["Región"] = deducir_region(tl)
-                l_m2 = card.find('span', class_="project-card__stat-label", string=re.compile("m²", re.IGNORECASE))
+                    tl = loc.get_text(strip=True)
+                    data["Ubicación"] = tl
+                    data["Región"] = deducir_region(tl)
+                l_m2 = card.find(
+                    'span', class_="project-card__stat-label",
+                    string=re.compile("m²", re.IGNORECASE)
+                )
                 if l_m2:
-                    v_m2 = l_m2.find_previous_sibling('span', class_="project-card__stat-value")
-                    if v_m2: data["Superficie"] = v_m2.get_text(strip=True) + " m²"
+                    v_m2 = l_m2.find_previous_sibling(
+                        'span', class_="project-card__stat-value"
+                    )
+                    if v_m2:
+                        data["Superficie"] = v_m2.get_text(strip=True) + " m²"
                 
                 # FECHA (Periodo)
-                l_per = card.find('span', class_="project-card__stat-label", string=re.compile("Periodo", re.IGNORECASE))
+                l_per = card.find(
+                    'span', class_="project-card__stat-label",
+                    string=re.compile("Periodo", re.IGNORECASE)
+                )
                 if l_per:
-                    v_per = l_per.find_previous_sibling('span', class_="project-card__stat-value")
-                    if v_per: data["Estado/Entrega"] = v_per.get_text(strip=True)
+                    v_per = l_per.find_previous_sibling(
+                        'span', class_="project-card__stat-value"
+                    )
+                    if v_per:
+                        data["Estado/Entrega"] = v_per.get_text(strip=True)
                 else:
                     data["Estado/Entrega"] = "Consultar"
 
-                if data["Obra"] != "N/A": todos.append(data)
-            except: continue
-        seen = set(); uniq = []
+                # Sin mapa → coords vacías
+                if data["Obra"] != "N/A":
+                    todos.append(data)
+            except:
+                continue
+        seen = set()
+        uniq = []
         for d in todos:
-            if d['Obra'] not in seen: uniq.append(d); seen.add(d['Obra'])
+            if d['Obra'] not in seen:
+                uniq.append(d)
+                seen.add(d['Obra'])
         return uniq
-    except: return []
+    except:
+        return []
 
 # ==============================================================================
 # 🎯 EJECUCIÓN
 # ==============================================================================
+
 def imprimir_menu():
     print("\n" + "="*50)
-    print("   🏙️  SCRAPER INMOBILIARIO CHILE - PANEL V51")
+    print("   🏙️  SCRAPER INMOBILIARIO CHILE - PANEL V51 + COORDS")
     print("="*50)
     print("1. Escanear TODO (Las 10 Inmobiliarias)")
     print("2. Solo Rápidas (Requests)")
@@ -562,35 +1101,44 @@ def imprimir_menu():
 
 def menu_especifico():
     print("\n1. EBCO\n2. INGEVEC\n3. SOCOVESA\n4. POCURO\n5. OVAL\n6. PACAL\n7. SANTOLAYA\n8. GUZMÁN\n9. PAZ\n10. CARRÁN")
-    try: return int(input(">> Elige número: "))
-    except: return 0
+    try:
+        return int(input(">> Elige número: "))
+    except:
+        return 0
 
 def ejecutar_modulo(driver, num):
     if num == 1: return modulo_ebco(driver)
-    elif num == 2: return modulo_ingevec(driver)
-    elif num == 3: return modulo_socovesa(driver)
-    elif num == 4: return modulo_pocuro(driver)
-    elif num == 5: return modulo_oval(driver)
-    elif num == 6: return modulo_pacal(driver)
-    elif num == 7: return modulo_santolaya(driver)
-    elif num == 8: return modulo_guzman(driver)
-    elif num == 9: return modulo_paz(driver)
-    elif num == 10: return modulo_carran(driver)
+    if num == 2: return modulo_ingevec(driver)
+    if num == 3: return modulo_socovesa(driver)
+    if num == 4: return modulo_pocuro(driver)
+    if num == 5: return modulo_oval(driver)
+    if num == 6: return modulo_pacal(driver)
+    if num == 7: return modulo_santolaya(driver)
+    if num == 8: return modulo_guzman(driver)
+    if num == 9: return modulo_paz(driver)
+    if num == 10: return modulo_carran(driver)
     return []
 
 def guardar_datos(datos, modo_archivo):
-    if not datos: print("❌ No hay datos."); return
+    if not datos:
+        print("❌ No hay datos.")
+        return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     fecha_hoy = datetime.now().strftime("%d/%m/%Y")
     
     # Agregar fecha a todos los registros
-    for d in datos: d["Fecha Scrapeo"] = fecha_hoy
+    for d in datos:
+        d["Fecha Scrapeo"] = fecha_hoy
 
     if modo_archivo == 1:
         df = pd.DataFrame(datos)
         df = df.drop_duplicates(subset=['Obra', 'Inmobiliaria'])
-        # Reordenar columnas para que se vea bien
-        cols = ["Fecha Scrapeo", "Inmobiliaria", "Obra", "Estado/Entrega", "Ubicación", "Región", "Superficie", "Link", "Mandante"]
+        cols = [
+            "Fecha Scrapeo", "Inmobiliaria", "Obra", "Estado/Entrega",
+            "Ubicación", "Región", "Superficie",
+            "Latitud", "Longitud",
+            "Link", "Mandante"
+        ]
         exist_cols = [c for c in cols if c in df.columns]
         df = df[exist_cols]
         nombre = f"Consolidado_Chile_{timestamp}.xlsx"
@@ -609,44 +1157,87 @@ def guardar_datos(datos, modo_archivo):
 def main():
     while True:
         imprimir_menu()
-        try: opcion = int(input(">> Opción: "))
-        except: continue
-        if opcion == 0: break
+        try:
+            opcion = int(input(">> Opción: "))
+        except:
+            continue
+        if opcion == 0:
+            break
 
         print("\n--- SALIDA ---")
         print("1. Un solo Excel\n2. Multiples archivos")
-        try: modo = int(input(">> Elige: "))
-        except: modo = 1
+        try:
+            modo = int(input(">> Elige: "))
+        except:
+            modo = 1
 
         todos = []
         driver = None
-        print("   🌐 Iniciando motor...")
-        driver = iniciar_selenium()
+
+        # Ver si realmente hace falta Selenium
+        usa_selenium = False
+        sel = None
+        if opcion == 1:
+            usa_selenium = True
+        elif opcion == 2:
+            usa_selenium = False
+        elif opcion == 3:
+            usa_selenium = True
+        elif opcion == 4:
+            sel = menu_especifico()
+            usa_selenium = sel in [4, 7, 8, 9, 10]
+
+        if usa_selenium:
+            print("   🌐 Iniciando motor...")
+            driver = iniciar_selenium()
         
         try:
-            if opcion == 1: # TODAS
-                tareas = [("EBCO", modulo_ebco, False), ("INGEVEC", modulo_ingevec, False), ("SOCOVESA", modulo_socovesa, False), ("POCURO", modulo_pocuro, True), ("OVAL", modulo_oval, False), ("PACAL", modulo_pacal, False), ("SANTOLAYA", modulo_santolaya, True), ("GUZMAN", modulo_guzman, True), ("PAZ", modulo_paz, True), ("CARRAN", modulo_carran, True)]
+            if opcion == 1:  # TODAS
+                tareas = [
+                    ("EBCO", modulo_ebco, False),
+                    ("INGEVEC", modulo_ingevec, False),
+                    ("SOCOVESA", modulo_socovesa, False),
+                    ("POCURO", modulo_pocuro, True),
+                    ("OVAL", modulo_oval, False),
+                    ("PACAL", modulo_pacal, False),
+                    ("SANTOLAYA", modulo_santolaya, True),
+                    ("GUZMAN", modulo_guzman, True),
+                    ("PAZ", modulo_paz, True),
+                    ("CARRAN", modulo_carran, True),
+                ]
                 pbar = tqdm(tareas, desc="Progreso", unit="empresa")
-                for nom, func, _ in pbar:
+                for nom, func, usa_sel in pbar:
                     pbar.set_description(f"Procesando {nom}")
+                    if usa_sel and not driver:
+                        driver = iniciar_selenium()
                     todos.extend(func(driver))
                     time.sleep(1)
-            elif opcion == 2:
+
+            elif opcion == 2:  # Solo Rápidas
                 modulos = [modulo_ebco, modulo_ingevec, modulo_socovesa, modulo_oval, modulo_pacal]
-                for m in tqdm(modulos, desc="Rápidas"): todos.extend(m(driver))
-            elif opcion == 3:
+                for m in tqdm(modulos, desc="Rápidas"):
+                    todos.extend(m(driver))
+
+            elif opcion == 3:  # Solo Lentas
                 modulos = [modulo_pocuro, modulo_santolaya, modulo_guzman, modulo_paz, modulo_carran]
-                for m in tqdm(modulos, desc="Lentas"): todos.extend(m(driver))
-            elif opcion == 4:
-                sel = menu_especifico()
-                if sel > 0: todos.extend(ejecutar_modulo(driver, sel))
+                for m in tqdm(modulos, desc="Lentas"):
+                    todos.extend(m(driver))
+
+            elif opcion == 4:  # Una específica
+                if sel is None:
+                    sel = menu_especifico()
+                if sel > 0:
+                    todos.extend(ejecutar_modulo(driver, sel))
 
             guardar_datos(todos, modo)
-            if opcion != 4: input("\n✅ Listo. Enter para volver...")
+            if opcion != 4:
+                input("\n✅ Listo. Enter para volver...")
 
-        except Exception as e: print(f"\n❌ Error: {e}")
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
         finally:
-            if driver: driver.quit()
+            if driver:
+                driver.quit()
 
 if __name__ == "__main__":
     main()
