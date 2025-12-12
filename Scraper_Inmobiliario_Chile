@@ -31,24 +31,25 @@ HEADERS = {
 # ==============================================================================
 
 def _coords_desde_url_maps(url: str):
-    """
-    Intenta extraer coordenadas de URLs de Google Maps / Waze:
-    - https://www.google.com/maps/@LAT,LON,zoom...
-    - ...!3dLAT!4dLON...
-    - ...?ll=LAT,LON...
-    Devuelve (lat, lon) o (None, None). [web:58][web:80]
-    """
-    # @LAT,LON,zoom
+    # Caso @LAT,LON,zoom
     m = re.search(r"@(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", url)
     if m:
         return m.group(1), m.group(2)
 
-    # !3dLAT!4dLON
+    # Caso !3dLAT!4dLON (un formato de Google Maps)
     m = re.search(r"!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)", url)
     if m:
         return m.group(1), m.group(2)
 
-    # ?ll=LAT,LON
+    # Caso !2dLON!3dLAT (como en tu iframe de INGEVEC)
+    m = re.search(r"!2d(-?\d{1,3}\.\d+)!3d(-?\d{1,2}\.\d+)", url)
+    if m:
+        # ojo: aquí viene LON primero, luego LAT
+        lon = m.group(1)
+        lat = m.group(2)
+        return lat, lon
+
+    # Caso ?ll=LAT,LON (Google Maps / Waze)
     m = re.search(r"[?&]ll=(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)", url)
     if m:
         return m.group(1), m.group(2)
@@ -285,26 +286,37 @@ def modulo_ebco(driver=None):
 # 2. INGEVEC (tiene botón Maps)
 def modulo_ingevec(driver=None):
     try:
+        # 1) Listado de proyectos en venta
         res = requests.get(
             "https://ingevecinmobiliaria.cl/proyectos-en-venta",
             headers=HEADERS, verify=False, timeout=15
         )
         soup = BeautifulSoup(res.text, 'html.parser')
+
         links = []
         for a in soup.find_all('a', href=True):
             h = a['href'].lower()
+            txt_a = a.get_text(" ", strip=True).lower()
             if (
-                "ver proyecto" in a.get_text(" ", strip=True).lower()
-                or "proyecto" in h or "ficha" in h or "form_" in h
+                "ver proyecto" in txt_a
+                or "proyecto" in h
+                or "ficha" in h
+                or "form_" in h
             ):
                 if any(x in h for x in ["whatsapp", "facebook", "maps", "mailto"]):
                     continue
                 if "proyectos-en-venta" in h:
                     continue
-                full = "https://ingevecinmobiliaria.cl" + a['href'] if a['href'].startswith("/") else a['href']
+                full = (
+                    "https://ingevecinmobiliaria.cl" + a['href']
+                    if a['href'].startswith("/") else a['href']
+                )
                 if full.startswith("http"):
                     links.append(full)
+
         todos = []
+
+        # 2) Recorrer cada ficha
         for url in set(links):
             d = {
                 "Inmobiliaria": "INMOBILIARIA Y CONSTRUCTORA INGEVEC S.A",
@@ -321,49 +333,63 @@ def modulo_ingevec(driver=None):
                 r = requests.get(url, headers=HEADERS, verify=False, timeout=10)
                 s = BeautifulSoup(r.text, 'html.parser')
                 t = s.get_text(" ", strip=True)
-                pat = {
+
+                # Nombre, dirección, superficie desde texto de ficha
+                patrones = {
                     "Obra": r"Nombre[:\s]+(.*?)(?=Direcci|Dormitorios|$)",
                     "Ubicación": r"Direcci[oó]n[:\s]+(.*?)(?=Dormitorios|Baños|Superficie|$)",
                     "Superficie": r"Superficie total[:\s]+(.*?)(?=Estac|Estado|$)"
                 }
-                for k, v in pat.items():
+                for k, v in patrones.items():
                     m = re.search(v, t, re.IGNORECASE)
                     if m:
                         d[k] = m.group(1).strip()[:100]
+
+                # Si no hay dirección clara, intentar usar texto de enlaces a Maps/Waze
                 if d["Ubicación"] == "N/A":
                     for a in s.find_all('a', href=True):
-                        if "maps" in a['href'] or "waze" in a['href']:
-                            tx = a.get_text(strip=True)
-                            if (
-                                len(tx) > 5
-                                and any(c.isdigit() for c in tx)
-                                and "mapa" not in tx.lower()
-                            ):
-                                d["Ubicación"] = tx
+                        href_l = a['href'].lower()
+                        if "maps.google.com" in href_l or "waze.com" in href_l:
+                            tx = a.get_text(" ", strip=True)
+                            if len(tx) > 5 and "mapa" not in tx.lower():
+                                d["Ubicación"] = tx.strip()
                                 break
+
+                # Normalizar nombre de obra
                 if d["Obra"] != "N/A":
                     d["Obra"] = separar_palabras_pegadas(d["Obra"])
-                if d["Obra"] == "N/A" or any(
-                    m in d["Obra"].lower()
-                    for m in ["conectividad", "entrega", "ganadora"]
+                if (
+                    d["Obra"] == "N/A"
+                    or any(m in d["Obra"].lower() for m in ["conectividad", "entrega", "ganadora"])
                 ):
                     d["Obra"] = limpiar_nombre_url(url)
+
+                # Región a partir de ubicación + nombre
                 if not d["Región"]:
                     d["Región"] = deducir_region(d["Ubicación"] + " " + d["Obra"])
-                
-                # FECHA
+
+                # FECHA / estado
                 d["Estado/Entrega"] = extraer_fecha_entrega(t)
 
-                # COORDENADAS
+                # COORDENADAS:
+                # - iframes embed (patrón !2dLON!3dLAT)
+                # - enlaces Google Maps / Waze con ll=LAT,LON
                 lat, lon = extraer_coordenadas_desde_mapas(s)
                 d["Latitud"] = lat or ""
                 d["Longitud"] = lon or ""
-                
+
+                # DEBUG opcional
+                # print("INGEVEC:", d["Obra"], "→", d["Latitud"], d["Longitud"])
+
                 todos.append(d)
-            except:
-                pass
+            except Exception as e:
+                print("Error ficha INGEVEC:", url, e)
+                continue
+
         return todos
-    except:
+
+    except Exception as e:
+        print("Error listado INGEVEC:", e)
         return []
 
 # 3. SOCOVESA (Leaflet + botón Maps)
