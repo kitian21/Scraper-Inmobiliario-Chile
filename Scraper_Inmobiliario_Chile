@@ -824,13 +824,16 @@ def modulo_guzman(driver):
     url = "https://www.guzmanylarrain.com/proyectos/venta"
     proyectos = []
     try:
+        # 1) Listado general
         driver.get(url)
         time.sleep(4)
         for _ in range(2):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(1.5)
+
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         tarjetas = soup.find_all('a', class_="bxPrList")
+
         for tarjeta in tarjetas:
             try:
                 href = tarjeta.get('href')
@@ -840,6 +843,7 @@ def modulo_guzman(driver):
                     "https://www.guzmanylarrain.com" + href
                     if href.startswith("/") else href
                 )
+
                 data = {
                     "Inmobiliaria": "CONSTRUCTORA GUZMAN Y LARRAI\u00ADN LTDA.",
                     "Obra": "N/A",
@@ -851,58 +855,70 @@ def modulo_guzman(driver):
                     "Longitud": "",
                     "Link": full_link
                 }
+                # Nombre desde la tarjeta
                 h4 = tarjeta.find('h4')
                 data["Obra"] = h4.get_text(strip=True) if h4 else "N/A"
+                # Ciudad / región desde la tarjeta
                 ci = tarjeta.find('div', class_="titCiudad")
                 if ci:
                     c = ci.get_text(strip=True)
                     data["Región"] = deducir_region(c)
                     data["Ubicación"] = c
+                # Superficie desde la tarjeta
                 txt_card = tarjeta.get_text(" ", strip=True)
-                m = re.search(r"(\d+[\.,]?\d*)\s*m²", txt_card)
-                if m:
-                    data["Superficie"] = m.group(0)
-                
-                # FECHA
+                m_sup = re.search(r"(\d+[\.,]?\d*)\s*m²", txt_card)
+                if m_sup:
+                    data["Superficie"] = m_sup.group(0)
+                # Estado / entrega aproximado desde tarjeta
                 data["Estado/Entrega"] = extraer_fecha_entrega(txt_card)
-                
                 proyectos.append(data)
             except:
                 continue
     except:
         return []
+    # 2) Detalle por ficha para completar ubicación + coordenadas
     finales = []
     for p in proyectos:
         try:
-            driver.get(p['Link'])
-            time.sleep(1.5)
+            driver.get(p["Link"])
+            time.sleep(4)
             s = BeautifulSoup(driver.page_source, 'html.parser')
-            icons = s.find_all('i', class_=re.compile("icn-moon|icon-location"))
+            txt_det = s.get_text(" ", strip=True)
+
+            # Mejorar ubicación buscando párrafos con ícono de ubicación
+            icons = s.find_all('div', class_=re.compile("txtUbi|ulUbi|icnUbi|icn-sala"))
             found = False
-            for ic in icons:
-                par = ic.find_parent('p')
-                if par:
-                    txt = par.get_text(strip=True)
-                    if len(txt) > 5 and any(c.isdigit() for c in txt):
-                        p["Ubicación"] = txt
+            for block in icons:
+                # buscar <p> dentro de este bloque que parezcan dirección
+                ps = block.find_all('p')
+                for par in ps:
+                    t = par.get_text(" ", strip=True)
+                    if len(t) > 5 and any(c.isdigit() for c in t):
+                        p["Ubicación"] = t
                         found = True
                         break
+                if found:
+                    break
             if not found:
-                txt_det = s.get_text(" ", strip=True)
-                m = re.search(
+                # Fallback: texto con "Dirección"
+                m_dir = re.search(
                     r"Direcci[oó]n\s*[:\.]?\s*(.*?)(?=Horario|Teléfono|$)",
                     txt_det, re.IGNORECASE
                 )
-                if m:
-                    p["Ubicación"] = m.group(1).strip()
-
+                if m_dir:
+                    p["Ubicación"] = m_dir.group(1).strip()
+            # Región si quedó vacía
+            if not p["Región"]:
+                p["Región"] = deducir_region(p["Ubicación"] + " " + txt_det)
             # COORDENADAS desde Waze/Maps/Leaflet
             lat, lon = extraer_coordenadas_desde_mapas(s)
             p["Latitud"] = lat or ""
             p["Longitud"] = lon or ""
-
+            # DEBUG opcional
+            # print("GUZMAN:", p["Obra"], "→", p["Latitud"], p["Longitud"])
             finales.append(p)
-        except:
+        except Exception as e:
+            print("Error ficha GUZMAN:", p["Link"], e)
             finales.append(p)
     return finales
 
